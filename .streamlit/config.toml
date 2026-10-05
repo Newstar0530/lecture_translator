@@ -11,4 +11,5 @@ primaryColor = "#6ea8fe"
 backgroundColor = "#0f1218"
 secondaryBackgroundColor = "#161a22"
 textColor = "#e6e8ee"
+baseFontSize = 18        # 整體字級（預設 16）
 borderColor = "#262b36"
