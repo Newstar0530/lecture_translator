@@ -95,6 +95,17 @@ streamlit run app.py
 
 ---
 
+## 筆記傳到 Notion（選填）
+
+產生筆記後，按筆記旁邊的 **「傳到 Notion」**，會在你的 Notion「課堂筆記」資料庫新增一頁（標題是「課程名稱｜日期」，並自動填好「課程」「日期」欄位）。第一次要先設定（約 5 分鐘）：
+
+1. 打開 https://www.notion.so/profile/integrations →「New integration」→ 名稱隨便取、選你的 workspace、類型選 **Internal** → 存檔
+2. 複製 **Internal Integration Secret**（`ntn_` 開頭），在 `.env` 加一行 `NOTION_TOKEN=貼上金鑰`，**重新啟動程式**
+3. 在 Notion 建立一個資料庫（Table），名稱建議有「筆記」兩個字，例如「課堂筆記」
+4. 打開那個資料庫 → 右上角「⋯」→「Connections」→ 加入剛剛建立的 integration
+
+「課程」「日期」欄位不用自己建，第一次傳的時候會自動新增。學校帳號的 Notion 如果不能建立 integration，就是管理員沒開放。
+
 ## 五、費用（以 2026 年 9 月查到的官方價格估算）
 
 | 項目 | 價格 | 一堂 3 小時的課 |

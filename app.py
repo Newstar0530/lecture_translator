@@ -17,6 +17,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import notion_sync
 from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
                   fmt_time, generate_notes, list_input_devices, merge_terms)
@@ -26,14 +27,14 @@ RECORDS_DIR = APP_DIR / "records"
 TERMS_DIR = APP_DIR / "專有名詞"
 
 
-def load_env_key() -> str:
-    """優先讀環境變數 MISTRAL_API_KEY，其次讀同資料夾的 .env 檔。"""
-    if os.getenv("MISTRAL_API_KEY"):
-        return os.environ["MISTRAL_API_KEY"]
+def load_env_key(name: str = "MISTRAL_API_KEY") -> str:
+    """優先讀環境變數，其次讀同資料夾的 .env 檔。"""
+    if os.getenv(name):
+        return os.environ[name]
     env = APP_DIR / ".env"
     if env.exists():
         for line in env.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("MISTRAL_API_KEY"):
+            if line.strip().startswith(name):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
 
@@ -117,6 +118,8 @@ class SharedState:
     session: LiveSession | None = None
     notes: str | None = None
     notes_path: Path | None = None
+    notes_meta: tuple[str, str] = ("", "")    # 筆記的（課程名稱, 日期），傳到 Notion 用
+    notion_url: str | None = None
 
 
 @st.cache_resource
@@ -240,7 +243,7 @@ if start_clicked:
             (out_dir / SLIDES_FILE).write_text(json.dumps(
                 {"name": slides["name"], "summary": slides["summary"], "terms": slides["terms"]},
                 ensure_ascii=False, indent=2), encoding="utf-8")
-        ss.notes = ss.notes_path = None
+        ss.notes = ss.notes_path = ss.notion_url = None
         ss.session.start()
         st.rerun()
 
@@ -261,6 +264,7 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
             ss.notes, ss.notes_path = notes, path
+            ss.notes_meta, ss.notion_url = (course, date_str), None
             box.update(label="筆記完成，在字幕下方", state="complete", expanded=False)
         except Exception as e:
             box.update(label=f"產生筆記失敗：{e}（已完成的段落有暫存，再按一次會接續）", state="error")
@@ -333,10 +337,31 @@ live_view()
 
 if ss.notes:
     st.divider()
-    head_l, head_r = st.columns([3, 1], vertical_alignment="center")
+    head_l, head_m, head_r = st.columns([2.4, 1, 1.2], vertical_alignment="center")
     head_l.subheader("📝 筆記")
-    head_r.download_button("下載 .md", ss.notes, file_name=Path(ss.notes_path).name, use_container_width=True)
+    head_m.download_button("下載 .md", ss.notes, file_name=Path(ss.notes_path).name, use_container_width=True)
+    notion_token = load_env_key("NOTION_TOKEN")
+    if notion_token:
+        to_notion = head_r.button("傳到 Notion", type="primary", use_container_width=True)
+    else:
+        to_notion = False
+        head_r.caption("設定 Notion 後可以直接傳過去（見 README）")
     st.caption(f"已存檔：{ss.notes_path}")
+    if to_notion:
+        with st.spinner("傳到 Notion 中…"):
+            try:
+                dbs = notion_sync.find_databases(notion_token)
+                if not dbs:
+                    st.error("找不到可以寫入的 Notion 資料庫：請在 Notion 打開「課堂筆記」資料庫 → 右上角「⋯」→"
+                             "「Connections」→ 加入你建立的 integration")
+                else:
+                    # 有好幾個資料庫時，優先用名稱有「筆記」的
+                    ds_id, _ = next((d for d in dbs if "筆記" in d[1]), dbs[0])
+                    ss.notion_url = notion_sync.push_notes(notion_token, ds_id, *ss.notes_meta, ss.notes)
+            except Exception as e:
+                st.error(f"傳到 Notion 失敗：{e}")
+    if ss.notion_url:
+        st.success(f"已傳到 Notion：[打開頁面]({ss.notion_url})")
     with st.container(border=True, key="notes"):
         # 粗體緊貼中文標點時 Markdown 不會解析（會看到 **），顯示時直接換成 HTML 粗體
         st.markdown(re.sub(r"\*\*([^*\n]+?)\*\*", r"<strong>\1</strong>", ss.notes), unsafe_allow_html=True)
