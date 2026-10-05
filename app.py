@@ -278,7 +278,7 @@ with st.sidebar:
     if not api_key:
         st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
 
-    course = st.text_input("Course name", placeholder="Strategies in the arts")
+    course = st.text_input("Course name")
 
     # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
     slides_file = st.file_uploader("Lecture slides (recommended)", type=["pdf", "pptx"],
@@ -597,10 +597,10 @@ def terms_panel():
 
     st.markdown("#### Fix a translation")
     with st.form("fix_term", clear_on_submit=True, border=False):
-        en = st.text_input("Term (original)", placeholder="merit goods",
+        en = st.text_input("Term (original)",
                            help="Enter the full term (e.g. merit goods), not a common word like goods or board — "
                                 "otherwise everyday uses of the word may be changed too")
-        zh = st.text_input("Correct translation", placeholder="有益財")
+        zh = st.text_input("Correct translation")
         if st.form_submit_button("Apply", use_container_width=True):
             if not en.strip() or not zh.strip():
                 st.warning("Fill in both fields")
