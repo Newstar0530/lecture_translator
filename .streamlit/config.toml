@@ -1,6 +1,8 @@
 # 只讓這台電腦自己連線，同一個 Wi-Fi 的其他人連不進來
 [server]
 address = "localhost"
+# 上傳檔案（簡報、WAV）的大小上限，單位 MB（預設 200）
+maxUploadSize = 500
 
 # 深色主題：教室裡比較不刺眼
 [theme]

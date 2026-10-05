@@ -149,13 +149,16 @@ with st.sidebar:
         elif api_key:
             with st.spinner("讀取簡報中…（約 10 秒）"):
                 try:
-                    brief, terms = analyze_slides(api_key, extract_slide_text(slides_file.name, data))
-                    slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms}
+                    brief, terms, warning = analyze_slides(api_key, extract_slide_text(slides_file.name, data))
+                    slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms,
+                              "warning": warning}
                     st.session_state.slides = slides
                 except Exception as e:
                     st.warning(f"讀不了這份簡報：{e}")
         if slides:
             with st.container(border=True):
+                if slides.get("warning"):
+                    st.warning(slides["warning"], icon="⚠️")
                 st.caption(f"📖 {slides['summary']}")
                 with st.popover(f"簡報裡的 {len(slides['terms'])} 個專有名詞", use_container_width=True):
                     st.markdown("\n".join(f"- {en} → **{zh}**" for en, zh in slides["terms"].items()) or "（沒有）")

@@ -760,18 +760,38 @@ def extract_slide_text(filename: str, data: bytes) -> str:
     raise ValueError("只支援 PDF 或 PPTX 檔")
 
 
+_PAGE_MARK = re.compile(r"\[第 \d+ 頁\]")
+
+
+def limit_slide_text(text: str, max_chars: int = SLIDES_MAX_CHARS) -> tuple[str, str]:
+    """
+    簡報文字太長時，只留前面完整的幾頁（不切到半頁）。
+    回傳（要送出的文字, 提醒訊息）；沒有超過就回傳原文和空字串。
+    """
+    if len(text) <= max_chars:
+        return text, ""
+    total = len(_PAGE_MARK.findall(text))
+    cut = text[:max_chars]
+    last_page = cut.rfind("\n\n[第 ")
+    if last_page > 0:
+        cut = cut[:last_page]
+    read = len(_PAGE_MARK.findall(cut))
+    return cut, f"簡報太長，只讀了前 {read} 頁（共 {total} 頁），後面頁面的專有名詞不會自動找到"
+
+
 def analyze_slides(api_key: str, text: str, model: str = DEFAULT_SLIDES_MODEL,
-                   client=None) -> tuple[str, dict[str, str]]:
-    """讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}）。"""
+                   client=None) -> tuple[str, dict[str, str], str]:
+    """讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}, 提醒訊息）。"""
     if not text.strip():
         raise ValueError("簡報裡讀不到文字（可能是掃描圖片檔）")
+    text, warning = limit_slide_text(text)
     if client is None:
         from mistralai.client import Mistral
         client = Mistral(api_key=api_key)
     resp = client.chat.complete(model=model, temperature=0.1, response_format={"type": "json_object"},
                                 messages=[{"role": "system", "content": SLIDES_SYSTEM},
-                                          {"role": "user", "content": text[:SLIDES_MAX_CHARS]}])
+                                          {"role": "user", "content": text}])
     data = json.loads(_message_text(resp))
     terms = {str(t["en"]).strip(): str(t["zh"]).strip() for t in data.get("terms") or []
              if isinstance(t, dict) and t.get("en") and t.get("zh")}
-    return str(data.get("summary", "")).strip(), terms
+    return str(data.get("summary", "")).strip(), terms, warning
