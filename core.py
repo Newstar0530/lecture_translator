@@ -198,7 +198,8 @@ def glossary_prompt(glossary: dict[str, str]) -> str:
     if not glossary:
         return ""
     lines = "\n".join(f"{en} = {zh}" for en, zh in glossary.items())
-    return "\n\n指定譯名（遇到這些名詞一定要使用這裡的中文譯名）：\n" + lines
+    return ("\n\n確認過的譯名：原文是同樣意思時，一定要使用這裡的中文譯名；"
+            "只有在原文明顯是另一個意思時（例如同一個字當一般用語），才依前後文翻譯。\n" + lines)
 
 
 def build_translate_messages(context: str, text: str, glossary: Optional[dict[str, str]] = None) -> list[dict]:

@@ -236,42 +236,34 @@ if ss.notes:
     st.markdown(ss.notes)
 
 
-# ---------------------------------------------------------------- 側邊欄：專有名詞
+# ---------------------------------------------------------------- 側邊欄：修正譯名
 @st.fragment
 def terms_panel():
     s: LiveSession | None = ss.session
-    # 有錄音（進行中或剛結束）就用那堂課的名詞表；還沒開始就顯示這門課之前修正過的譯名
+    # 有錄音（進行中或剛結束）就改那堂課；還沒開始就改這門課存起來的譯名
     book_course = s.cfg.course if s else course
     book = s.terms if s else TermBook(load_fixed_terms(course))
 
-    st.subheader("📚 專有名詞")
-    st.caption("翻譯裡附了原文的名詞會自動列在這裡。發現譯名不對，選它、填正確的譯名，"
-               "之後的翻譯和筆記就會照用；下次填同一個課程名稱也會自動套用。")
-    st.button("🔄 更新清單", use_container_width=True)
-    if msg := st.session_state.pop("term_msg", None):
-        st.success(msg)
-
-    rows = list(reversed(book.rows()))            # 最新出現的在最上面
-    if rows:
-        st.dataframe([{"原文": r["en"], "譯名": r["zh"], "": "✅" if r["fixed"] else ""} for r in rows],
-                     hide_index=True, use_container_width=True, height=min(36 * len(rows) + 38, 280))
-    else:
-        st.caption("開始錄音後，名詞會陸續出現。")
-
-    other = "（清單裡沒有，手動輸入）"
+    st.subheader("📚 修正譯名")
     with st.form("fix_term", clear_on_submit=True, border=False):
-        pick = st.selectbox("要修正的名詞", [r["en"] for r in rows] + [other])
-        manual_en = st.text_input("原文", placeholder="選「手動輸入」時才要填")
-        zh = st.text_input("正確的譯名", placeholder="例如：有益財")
+        en = st.text_input("沒翻好的原文名詞", placeholder="例如：merit goods",
+                           help="請填完整的名詞（例如 merit goods），不要只填 goods、board 這種常見單字，"
+                                "否則一般用法也可能被套用")
+        zh = st.text_input("正確的翻譯", placeholder="例如：有益財")
         if st.form_submit_button("套用", type="primary", use_container_width=True):
-            en = manual_en.strip() or ("" if pick == other else pick)
-            if not en or not zh.strip():
-                st.warning("請填好原文和正確的譯名")
+            if not en.strip() or not zh.strip():
+                st.warning("兩格都要填")
             else:
                 book.fix(en, zh)
                 save_fixed_terms(book_course, book.fixed())
-                st.session_state.term_msg = f"已套用：{en} → {zh.strip()}"
+                st.session_state.term_msg = f"已套用：{en.strip()} → {zh.strip()}"
                 st.rerun(scope="fragment")
+    if msg := st.session_state.pop("term_msg", None):
+        st.success(msg)
+    fixed = book.fixed()
+    if fixed:
+        st.caption("已修正（之後的翻譯和筆記會照用）：\n" +
+                   "\n".join(f"- {k} → {v}" for k, v in fixed.items()))
 
 
 with st.sidebar:
