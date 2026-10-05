@@ -129,7 +129,7 @@ st.html("""<style>
 .empty li:nth-child(3) { animation-delay:.45s; }
 
 /* 新字幕：文字浮上來、卡片外框亮一下（只在第一次出現時加 fresh） */
-.latest.fresh { animation: glow 1.6s ease-out; }
+.latest.fresh { animation: spin 6s linear infinite, glow 1.6s ease-out; }
 .latest.fresh .en { animation: riseIn .45s ease-out both; animation-delay:.3s; }
 
 /* 翻譯中：文字掃光 */
@@ -200,6 +200,52 @@ st.html("""<style>
   background: linear-gradient(100deg, transparent, rgba(255,255,255,.45), transparent); transform: skewX(-20deg); }
 [data-testid="stBaseButton-primary"]:hover::after { animation: shine .8s ease-out; }
 @keyframes shine { to { left: 130%; } }
+
+/* ---------- 更炫版 ---------- */
+/* 最新字幕卡：外框一圈流光不停旋轉（只有出新字幕時才會從頭開始，不會每秒重來） */
+@property --a { syntax: '\\3C angle\\3E'; inherits: false; initial-value: 0deg; }  /* 3C/3E 是角括號，直接寫的話 Streamlit 的 HTML 過濾器會把整段樣式刪掉 */
+@keyframes spin { to { --a: 360deg; } }
+.latest { position: relative; overflow: hidden;
+  background: linear-gradient(180deg, rgba(26,34,52,.85), rgba(20,25,36,.85)) padding-box,
+              conic-gradient(from var(--a), #6ea8fe, #a78bfa, #2dd4bf, #6ea8fe) border-box;
+  animation: spin 6s linear infinite;
+  box-shadow: 0 10px 40px -12px rgba(110,168,254,.35); }
+/* 全息光澤：每隔幾秒一道斜光掃過卡片 */
+.latest::after { content:""; position:absolute; top:-50%; left:-60%; width:35%; height:200%; pointer-events:none;
+  background: linear-gradient(100deg, transparent, rgba(167,139,250,.10), rgba(255,255,255,.12), rgba(110,168,254,.10), transparent);
+  transform: rotate(12deg); animation: sheen 5.5s ease-in-out infinite; }
+@keyframes sheen { 0%, 55% { left:-60%; } 100% { left:130%; } }
+
+/* 錄音中＝直播模式：背景極光變亮，頁面最上面一條流動的光 */
+.stApp::before { transition: filter 1.2s ease, opacity 1.2s ease; }
+.stApp:has(.pill.rec)::before { filter: blur(40px) saturate(1.5) brightness(1.35); }
+.stApp:has(.pill.rec)::after { content:""; position:fixed; top:0; left:0; right:0; height:3px; z-index:999999;
+  background: linear-gradient(90deg, #6ea8fe, #a78bfa, #2dd4bf, #6ea8fe); background-size: 200% 100%;
+  animation: flow 2.5s linear infinite; box-shadow: 0 0 14px rgba(167,139,250,.8); }
+
+/* 星點背景：細小光點慢慢閃 */
+[data-testid="stAppViewContainer"]::before { content:""; position:absolute; inset:0; z-index:-1; pointer-events:none;
+  background-image:
+    radial-gradient(1.2px 1.2px at 12% 22%, rgba(255,255,255,.55), transparent 60%),
+    radial-gradient(1px 1px at 33% 68%, rgba(167,139,250,.6), transparent 60%),
+    radial-gradient(1.4px 1.4px at 58% 14%, rgba(110,168,254,.6), transparent 60%),
+    radial-gradient(1px 1px at 77% 46%, rgba(255,255,255,.45), transparent 60%),
+    radial-gradient(1.2px 1.2px at 88% 82%, rgba(45,212,191,.55), transparent 60%),
+    radial-gradient(1px 1px at 46% 88%, rgba(255,255,255,.4), transparent 60%),
+    radial-gradient(1.3px 1.3px at 22% 52%, rgba(110,168,254,.5), transparent 60%),
+    radial-gradient(1px 1px at 67% 32%, rgba(167,139,250,.5), transparent 60%);
+  background-size: 520px 520px; animation: twinkle 6s ease-in-out infinite alternate; }
+@keyframes twinkle { from { opacity:.35; } to { opacity:.9; } }
+
+/* 標題：字發光、耳機輕輕上下浮動 */
+.app-title .grad { filter: drop-shadow(0 0 14px rgba(110,168,254,.35)); }
+.app-title .icon { display:inline-block; animation: bob 3s ease-in-out infinite; }
+@keyframes bob { 0%,100% { transform: translateY(0) rotate(-4deg); } 50% { transform: translateY(-3px) rotate(4deg); } }
+
+/* 字幕列表：越舊越淡，滑過會亮起來 */
+.seg { transition: background .2s ease, opacity .2s ease; border-radius: 10px; }
+.seg:nth-child(n+5) { opacity: .8; } .seg:nth-child(n+8) { opacity: .6; } .seg:nth-child(n+12) { opacity: .45; }
+.seg:hover { opacity: 1; background: rgba(110,168,254,.06); }
 
 /* 系統設定「減少動態效果」時全部關掉 */
 @media (prefers-reduced-motion: reduce) {
@@ -314,7 +360,7 @@ sess: LiveSession | None = ss.session
 running = bool(sess and sess.running)
 
 shown_course = (sess.cfg.course if sess else course) or "Untitled course"
-st.html(f'<div class="app-head"><div class="app-title">🎧 <span class="grad">Nova&#39;s translator</span></div>'
+st.html(f'<div class="app-head"><div class="app-title"><span class="icon">🎧</span> <span class="grad">Nova&#39;s translator</span></div>'
         f'<div class="app-sub">{html.escape(shown_course)}</div></div>')
 b1, b2, b4, b3 = st.columns([1, 1, 0.75, 1.2], vertical_alignment="center")
 start_clicked = stop_clicked = False
