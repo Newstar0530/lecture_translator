@@ -71,7 +71,7 @@ def save_fixed_terms(course: str, terms: dict[str, str]):
         json.dumps(terms, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-st.set_page_config(page_title="Live Lecture Translator", page_icon="🎧", layout="wide")
+st.set_page_config(page_title="Nova's translator", page_icon="🎧", layout="wide")
 
 # 字幕、狀態列的樣式（主題色在 .streamlit/config.toml）
 st.html("""<style>
@@ -137,7 +137,6 @@ with st.sidebar:
     if not api_key:
         st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
 
-    st.markdown("#### This class")
     course = st.text_input("Course name", placeholder="e.g. Strategies in the arts")
 
     # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
@@ -220,7 +219,7 @@ sess: LiveSession | None = ss.session
 running = bool(sess and sess.running)
 
 shown_course = (sess.cfg.course if sess else course) or "Untitled course"
-st.html(f'<div class="app-head"><div class="app-title">🎧 Live Lecture Translator</div>'
+st.html(f'<div class="app-head"><div class="app-title">🎧 Nova&#39;s translator</div>'
         f'<div class="app-sub">{html.escape(shown_course)}</div></div>')
 b1, b2, b3 = st.columns([1, 1, 1.2], vertical_alignment="center")
 start_clicked = stop_clicked = False
