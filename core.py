@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -355,6 +356,7 @@ class LiveSession:
         self._audio_file = None
         self._caffeinate: Optional[subprocess.Popen] = None
         self._producer: Optional[threading.Thread] = None
+        self.levels: deque[float] = deque(maxlen=20)   # 最近 2 秒的音量（每 100 毫秒一格，0–1），畫音量表用
         self._written_upto = 0
         self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
 
@@ -503,6 +505,10 @@ class LiveSession:
     def _emit_audio(self, chunk: bytes):
         self._save_audio(chunk)
         self._audio_q.put(chunk)
+        # 音量換成 dB，-60 dB（幾乎沒聲音）到 -10 dB（很大聲）對應到 0–1
+        rms = float(np.sqrt(np.mean(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) ** 2))) if chunk else 0.0
+        db = 20 * np.log10(max(rms, 1.0) / 32768)
+        self.levels.append(min(max((db + 60) / 50, 0.0), 1.0))
 
     def _mic_loop(self):
         """

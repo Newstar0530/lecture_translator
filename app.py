@@ -130,8 +130,7 @@ st.html("""<style>
 
 /* 新字幕：文字浮上來、卡片外框亮一下（只在第一次出現時加 fresh） */
 .latest.fresh { animation: glow 1.6s ease-out; }
-.latest.fresh .zh, .latest.fresh .en { animation: riseIn .45s ease-out both; }
-.latest.fresh .en { animation-delay:.08s; }
+.latest.fresh .en { animation: riseIn .45s ease-out both; animation-delay:.3s; }
 
 /* 翻譯中：文字掃光 */
 .pending { font-style: normal; background: linear-gradient(90deg, var(--muted) 30%, #e6e8ee 50%, var(--muted) 70%);
@@ -156,6 +155,51 @@ st.html("""<style>
 
 /* 筆記卡片淡入 */
 .st-key-notes { animation: riseIn .5s ease-out both; }
+
+/* ---------- 酷炫版 ---------- */
+/* 極光背景：藍紫色光暈在深色背景後面緩慢飄動 */
+[data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stAppViewContainer"] { position: relative; z-index: 1; }
+.stApp::before { content:""; position:fixed; inset:-25%; z-index:0; pointer-events:none;
+  background:
+    radial-gradient(38% 32% at 22% 18%, rgba(110,168,254,.34), transparent 70%),
+    radial-gradient(34% 30% at 82% 22%, rgba(167,139,250,.28), transparent 70%),
+    radial-gradient(40% 34% at 58% 92%, rgba(45,212,191,.18), transparent 70%);
+  filter: blur(40px); animation: drift 26s ease-in-out infinite alternate; }
+@keyframes drift { 0% { transform: translate(0,0) rotate(0deg); } 50% { transform: translate(4%,-3%) rotate(8deg); }
+                   100% { transform: translate(-3%,4%) rotate(-6deg); } }
+
+/* 標題：漸層色帶慢慢流過 */
+.app-title .grad { background: linear-gradient(90deg, #e6e8ee 0%, #6ea8fe 25%, #a78bfa 50%, #2dd4bf 75%, #e6e8ee 100%);
+  background-size: 300% 100%; -webkit-background-clip:text; background-clip:text; color:transparent;
+  animation: flow 10s linear infinite; }
+@keyframes flow { from { background-position: 0% 0; } to { background-position: 300% 0; } }
+
+/* 玻璃卡片 */
+.statusbar, .empty, .st-key-notes { background: rgba(22,26,34,.55) !important; backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px); border-color: rgba(255,255,255,.07) !important; }
+.latest { border: 1px solid transparent; border-left-width: 1px;
+  background: linear-gradient(180deg, rgba(26,34,52,.82), rgba(20,25,36,.82)) padding-box,
+              linear-gradient(135deg, rgba(110,168,254,.85), rgba(167,139,250,.55) 50%, rgba(45,212,191,.45)) border-box;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+
+/* 新字幕一個字一個字亮起來 */
+.ch { opacity: 0; animation: charIn .35s ease-out forwards; }
+@keyframes charIn { from { opacity:0; text-shadow: 0 0 14px rgba(110,168,254,.95); }
+                    to { opacity:1; text-shadow: 0 0 0 rgba(110,168,254,0); } }
+
+/* 即時音量表 */
+.meter { display:inline-flex; align-items:flex-end; gap:2px; height:1rem; vertical-align:-2px; }
+.meter i { width:3px; min-height:2px; border-radius:2px; background: linear-gradient(180deg, #2dd4bf, #6ea8fe); opacity:.9; }
+.meter.quiet i { background: var(--muted); opacity:.5; }
+
+/* 開始按鈕：漸層＋滑過時一道光掃過 */
+[data-testid="stBaseButton-primary"] { background: linear-gradient(135deg, #6ea8fe, #a78bfa) !important;
+  border: none !important; position: relative; overflow: hidden; }
+[data-testid="stBaseButton-primary"]::after { content:""; position:absolute; top:0; left:-60%; width:40%; height:100%;
+  background: linear-gradient(100deg, transparent, rgba(255,255,255,.45), transparent); transform: skewX(-20deg); }
+[data-testid="stBaseButton-primary"]:hover::after { animation: shine .8s ease-out; }
+@keyframes shine { to { left: 130%; } }
 
 /* 系統設定「減少動態效果」時全部關掉 */
 @media (prefers-reduced-motion: reduce) {
@@ -270,7 +314,7 @@ sess: LiveSession | None = ss.session
 running = bool(sess and sess.running)
 
 shown_course = (sess.cfg.course if sess else course) or "Untitled course"
-st.html(f'<div class="app-head"><div class="app-title">🎧 Nova&#39;s translator</div>'
+st.html(f'<div class="app-head"><div class="app-title">🎧 <span class="grad">Nova&#39;s translator</span></div>'
         f'<div class="app-sub">{html.escape(shown_course)}</div></div>')
 b1, b2, b4, b3 = st.columns([1, 1, 0.75, 1.2], vertical_alignment="center")
 start_clicked = stop_clicked = False
@@ -351,6 +395,11 @@ def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
         zh = '<span class="pending">Translating…</span>'
     elif seg.error:
         zh = f'<span class="err">{html.escape(seg.error)}</span>'
+    elif fresh:
+        # 新字幕一個字一個字亮起來；整句在 0.8 秒內出完，下一次畫面更新（1 秒後）前就結束
+        step = min(18, 800 // max(len(seg.translation), 1))
+        zh = "".join(f'<span class="ch" style="animation-delay:{i * step}ms">{html.escape(c)}</span>'
+                     for i, c in enumerate(seg.translation))
     else:
         zh = html.escape(seg.translation)
     en = f'<div class="en">{html.escape(seg.source)}</div>' if show_en else ""
@@ -358,6 +407,14 @@ def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
     if latest:
         return f'<div class="latest{" fresh" if fresh else ""}">{t}<div class="zh">{zh}</div>{en}</div>'
     return f'<div class="seg">{t}<div class="zh">{zh}</div>{en}</div>'
+
+
+def meter_html(s: LiveSession) -> str:
+    """最近 2 秒的麥克風音量長條圖；幾乎沒聲音時變灰，提醒可能沒收到音。"""
+    levels = list(s.levels) or [0.0]
+    bars = "".join(f'<i style="height:{max(lv, .08) * 100:.0f}%"></i>' for lv in levels)
+    quiet = " quiet" if max(levels) < .15 else ""
+    return f'<span><span class="k">Mic</span><span class="meter{quiet}">{bars}</span></span>'
 
 
 @st.fragment(run_every=1.0)
@@ -380,7 +437,8 @@ def live_view():
     label = status.replace("🔴 ", "")
     st.html(f'<div class="statusbar"><span class="pill {kind}"><span class="dot"></span>{html.escape(label)}</span>'
             f'<span><span class="k">Time</span><span class="v">{fmt_time(s.elapsed())}</span></span>'
-            f'<span><span class="k">Recognition cost</span><span class="v">≈ ${s.est_cost():.2f}</span></span></div>')
+            f'<span><span class="k">Recognition cost</span><span class="v">≈ ${s.est_cost():.2f}</span></span>'
+            f'{meter_html(s) if s.running else ""}</div>')
     if errors:
         with st.expander(f"⚠️ Messages ({len(errors)})"):
             st.text("\n".join(errors[-20:]))
