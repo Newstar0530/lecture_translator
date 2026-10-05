@@ -19,7 +19,6 @@ from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODE
 
 APP_DIR = Path(__file__).parent
 RECORDS_DIR = APP_DIR / "records"
-GLOSSARY_DIR = APP_DIR / "詞彙表"
 
 
 def load_env_key() -> str:
@@ -36,11 +35,6 @@ def load_env_key() -> str:
 
 def safe_name(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", s).strip() or "未命名課程"
-
-
-def load_glossary(course: str) -> str:
-    f = GLOSSARY_DIR / f"{safe_name(course)}.txt"
-    return f.read_text(encoding="utf-8") if f.exists() else ""
 
 
 st.set_page_config(page_title="即時上課翻譯", page_icon="🎧", layout="wide")
@@ -68,16 +62,6 @@ with st.sidebar:
     if not api_key:
         st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     course = st.text_input("課程名稱", placeholder="例如：Strategies in the arts")
-
-    # 每門課一份詞彙表，存在 詞彙表/課程名稱.txt，下次填同一個課程名稱會自動載入
-    glossary_file = GLOSSARY_DIR / f"{safe_name(course)}.txt"
-    saved_glossary = load_glossary(course)
-    glossary = st.text_area("課程詞彙表（選填）", value=saved_glossary, key=f"glossary_{safe_name(course)}",
-                            placeholder="每行一個：原文 = 中文\nmerit goods = 有益財\narm's length principle = 臂距原則",
-                            help="翻譯和筆記遇到這些名詞，會固定用你指定的中文。依課程名稱分開自動存檔。")
-    if glossary != saved_glossary:
-        GLOSSARY_DIR.mkdir(exist_ok=True)
-        glossary_file.write_text(glossary, encoding="utf-8")
 
     source = st.radio("音訊來源", ["麥克風", "音訊檔（模擬上課）"], horizontal=True)
     device, wav_path, wav_speed = None, None, 1.0
@@ -131,7 +115,7 @@ if c1.button("▶ 開始", type="primary", disabled=running, use_container_width
                             stt_model=stt_model, translate_model=trans_model,
                             target_delay_ms=None if delay_opt == "預設" else int(delay_opt),
                             input_device=device, wav_path=wav_path, wav_speed=wav_speed,
-                            min_chars=min_chars, glossary=glossary)
+                            min_chars=min_chars)
         ss.session = LiveSession(cfg)
         ss.notes = ss.notes_path = None
         ss.session.start()
@@ -141,13 +125,13 @@ if c2.button("⏹ 停止", disabled=not running, use_container_width=True):
     sess.stop()
     st.rerun()
 
-def make_notes(transcript: str, course: str, date_str: str, out_dir: Path, glossary: str):
+def make_notes(transcript: str, course: str, date_str: str, out_dir: Path):
     """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
     cache_dir = out_dir / ".筆記暫存"
     with st.status("產生筆記中…", expanded=True) as box:
         try:
             notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
-                                   progress=box.write, cache_dir=cache_dir, glossary=glossary)
+                                   progress=box.write, cache_dir=cache_dir)
             path = out_dir / "筆記.md"
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -163,7 +147,7 @@ if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=Tru
         st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
-                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir, sess.cfg.glossary)
+                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir)
 
 # 程式當掉、關掉後，也能用 records/ 裡存好的逐字稿產生筆記
 saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
@@ -183,7 +167,7 @@ with st.expander("📂 從之前的逐字稿產生筆記"):
                 date_str, _, rest = pick.name.partition("_")
                 course_name = rest.partition("_")[2]
                 make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"),
-                           course_name, date_str, pick, load_glossary(course_name))
+                           course_name, date_str, pick)
 
 
 @st.fragment(run_every=1.0)
