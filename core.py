@@ -177,7 +177,7 @@ def load_wav_as_pcm16(path: str | Path) -> bytes:
         n_ch, width, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
         raw = w.readframes(n)
     if width != 2:
-        raise ValueError("只支援 16-bit PCM 的 WAV 檔")
+        raise ValueError("Only 16-bit PCM WAV files are supported")
     data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     if n_ch > 1:
         data = data.reshape(-1, n_ch).mean(axis=1)
@@ -335,7 +335,7 @@ class LiveSession:
         self.segments: list[Segment] = []
         self.partial = ""
         self.language: Optional[str] = None
-        self.status = "尚未開始"
+        self.status = "Not started"
         self.errors: list[str] = []
         self.started_at: Optional[float] = None
         self.ended_at: Optional[float] = None
@@ -370,13 +370,13 @@ class LiveSession:
                 self._audio_file = sf.SoundFile(self.audio_path, "w", samplerate=SAMPLE_RATE, channels=1,
                                                 format="FLAC", subtype="PCM_16")
             except Exception as e:
-                self._log_error(f"無法建立錄音檔，這次只存逐字稿：{e}")
+                self._log_error(f"Could not create the audio file; saving the transcript only: {e}")
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
-        self._set_status("停止中…（等待最後的辨識和翻譯）")
+        self._set_status("Stopping… (finishing the last lines)")
 
     def join(self, timeout: Optional[float] = None):
         if self._thread:
@@ -417,14 +417,14 @@ class LiveSession:
         try:
             asyncio.run(self._main())
         except Exception as e:  # 最後防線
-            self._log_error(f"程式錯誤：{e!r}")
+            self._log_error(f"Unexpected error: {e!r}")
         finally:
             if self._audio_file is not None:
                 self._audio_file.close()
                 self._audio_file = None
             self.running = False
             self.ended_at = time.time()
-            self._set_status("已停止")
+            self._set_status("Stopped")
 
     async def _main(self):
         client = self._make_client()
@@ -481,7 +481,7 @@ class LiveSession:
                     while not self._stop.is_set():
                         time.sleep(0.1)
         except Exception as e:
-            self._log_error(f"收音失敗：{e}")
+            self._log_error(f"Audio input failed: {e}")
             self._stop.set()
 
     async def _audio_stream(self) -> AsyncIterator[bytes]:
@@ -504,7 +504,7 @@ class LiveSession:
         try:
             self._audio_file.write(np.frombuffer(chunk, dtype=np.int16))
         except Exception as e:
-            self._log_error(f"錄音檔寫入失敗，之後只存逐字稿：{e}")
+            self._log_error(f"Writing the audio file failed; saving the transcript only from now on: {e}")
             self._audio_file = None
 
     async def _stt_loop(self, client):
@@ -514,7 +514,7 @@ class LiveSession:
         fmt = AudioFormat(encoding="pcm_s16le", sample_rate=SAMPLE_RATE)
         failures = 0
         while True:
-            self._set_status("連線中…")
+            self._set_status("Connecting…")
             try:
                 kwargs = dict(audio_stream=self._audio_stream(), model=self.cfg.stt_model, audio_format=fmt)
                 if self.cfg.target_delay_ms:
@@ -523,7 +523,7 @@ class LiveSession:
                     if isinstance(ev, TranscriptionStreamTextDelta):
                         failures = 0
                         if not self._stop.is_set():
-                            self._set_status("🔴 錄音中")
+                            self._set_status("Recording")
                         with self.lock:
                             pieces = self._buffer.add(ev.text)
                         for p in pieces:
@@ -535,15 +535,15 @@ class LiveSession:
                         break
                     elif isinstance(ev, RealtimeTranscriptionError):
                         msg = ev.error.message
-                        self._log_error(f"語音辨識錯誤：{getattr(msg, 'detail', msg)}")
+                        self._log_error(f"Speech recognition error: {getattr(msg, 'detail', msg)}")
                     elif getattr(ev, "type", None) in ("session.created", "session.updated"):
                         if not self._stop.is_set():
-                            self._set_status("🔴 錄音中")
+                            self._set_status("Recording")
             except Exception as e:
                 failures += 1
-                self._log_error(f"連線中斷（第 {failures} 次）：{e}")
+                self._log_error(f"Connection lost (attempt {failures}): {e}")
                 if failures > self.cfg.max_reconnects:
-                    self._log_error("重連次數太多，停止錄音。逐字稿已存檔。")
+                    self._log_error("Too many reconnection attempts; recording stopped. The transcript has been saved.")
                     self._stop.set()
                     return
                 await asyncio.sleep(min(2 * failures, 10))
@@ -591,9 +591,9 @@ class LiveSession:
                     wait = 5 * (attempt + 1) if "429" in str(e) else 1.5 * (attempt + 1)
                     if attempt == 2:
                         with self.lock:
-                            seg.error = f"翻譯失敗：{e}"
+                            seg.error = f"Translation failed: {e}"
                             seg.translation = ""
-                        self._log_error(f"翻譯失敗：{e}")
+                        self._log_error(f"Translation failed: {e}")
                     else:
                         await asyncio.sleep(wait)
             self._write_pending()
@@ -679,7 +679,7 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
     say = progress or (lambda s: None)
     chunks = chunk_text(transcript)
     if not chunks:
-        return "（沒有逐字稿內容）"
+        return "(No transcript content)"
 
     def ask(system, user):
         for attempt in range(retries):
@@ -693,7 +693,7 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                 if attempt == retries - 1 or "401" in str(e) or "403" in str(e):
                     raise
                 wait = 10 * (attempt + 1) if "429" in str(e) else 3 * (attempt + 1)
-                say(f"⚠️ 請求失敗，{wait} 秒後重試（第 {attempt + 1} 次）：{e}")
+                say(f"⚠️ Request failed, retrying in {wait}s (attempt {attempt + 1}): {e}")
                 time.sleep(wait)
 
     # 只給逐字稿裡真的出現過的名詞，避免模型把簡報上的名詞當成上課內容寫進筆記
@@ -713,15 +713,15 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
     for i, c in enumerate(chunks, 1):
         f = cache_file(c)
         if f is not None and f.exists():
-            say(f"第 {i}/{len(chunks)} 段之前已整理過，直接沿用")
+            say(f"Part {i}/{len(chunks)} was already done, reusing it")
             partials.append(f.read_text(encoding="utf-8"))
             continue
-        say(f"整理第 {i}/{len(chunks)} 段…")
+        say(f"Summarizing part {i}/{len(chunks)}…")
         part = ask(chunk_system, c)
         if f is not None:
             f.write_text(part, encoding="utf-8")
         partials.append(part)
-    say("合併成完整筆記…")
+    say("Merging into the final notes…")
     joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
     return _tidy_markdown(ask(merge_system, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}"))
 
@@ -757,7 +757,7 @@ def extract_slide_text(filename: str, data: bytes) -> str:
                 texts.append("備註：" + slide.notes_slide.notes_text_frame.text)
             out.append(f"[第 {i} 頁]\n" + "\n".join(texts))
         return "\n\n".join(out)
-    raise ValueError("只支援 PDF 或 PPTX 檔")
+    raise ValueError("Only PDF or PPTX files are supported")
 
 
 _PAGE_MARK = re.compile(r"\[第 \d+ 頁\]")
@@ -776,14 +776,14 @@ def limit_slide_text(text: str, max_chars: int = SLIDES_MAX_CHARS) -> tuple[str,
     if last_page > 0:
         cut = cut[:last_page]
     read = len(_PAGE_MARK.findall(cut))
-    return cut, f"簡報太長，只讀了前 {read} 頁（共 {total} 頁），後面頁面的專有名詞不會自動找到"
+    return cut, f"Slides too long: only the first {read} of {total} slides were read. Terms on later slides won't be picked up automatically."
 
 
 def analyze_slides(api_key: str, text: str, model: str = DEFAULT_SLIDES_MODEL,
                    client=None) -> tuple[str, dict[str, str], str]:
     """讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}, 提醒訊息）。"""
     if not text.strip():
-        raise ValueError("簡報裡讀不到文字（可能是掃描圖片檔）")
+        raise ValueError("No text found in the slides (they may be scanned images)")
     text, warning = limit_slide_text(text)
     if client is None:
         from mistralai.client import Mistral
