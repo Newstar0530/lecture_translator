@@ -350,14 +350,19 @@ if ss.notes:
     if to_notion:
         with st.spinner("傳到 Notion 中…"):
             try:
-                dbs = notion_sync.find_databases(notion_token)
-                if not dbs:
-                    st.error("找不到可以寫入的 Notion 資料庫：請在 Notion 打開「課堂筆記」資料庫 → 右上角「⋯」→"
+                # 先找名稱有「筆記」的資料庫；沒有的話，在分享給 integration 的頁面（例如 NEOMA）裡自動建立一個
+                ds_id = notion_sync.find_notes_database(notion_token)
+                pages = [] if ds_id else notion_sync.find_shared_pages(notion_token)
+                if not ds_id and len(pages) == 1:
+                    ds_id = notion_sync.create_notes_database(notion_token, pages[0][0])
+                if ds_id:
+                    ss.notion_url = notion_sync.push_notes(notion_token, ds_id, *ss.notes_meta, ss.notes)
+                elif not pages:
+                    st.error("Notion 裡沒有分享給這個 integration 的頁面：打開要放筆記的頁面 → 右上角「⋯」→"
                              "「Connections」→ 加入你建立的 integration")
                 else:
-                    # 有好幾個資料庫時，優先用名稱有「筆記」的
-                    ds_id, _ = next((d for d in dbs if "筆記" in d[1]), dbs[0])
-                    ss.notion_url = notion_sync.push_notes(notion_token, ds_id, *ss.notes_meta, ss.notes)
+                    st.error("分享給 integration 的頁面有好幾個（" + "、".join(t for _, t in pages) +
+                             "），不知道要放哪裡：請在要放筆記的頁面裡建立一個名稱有「筆記」的資料庫")
             except Exception as e:
                 st.error(f"傳到 Notion 失敗：{e}")
     if ss.notion_url:

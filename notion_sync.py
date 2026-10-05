@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from typing import Optional
 COURSE_PROP = "課程"
 DATE_PROP = "日期"
 TEXT_LIMIT = 2000        # Notion 每段文字最多 2000 字
@@ -26,6 +27,59 @@ def find_databases(token: str) -> list[tuple[str, str]]:
         title = "".join(t.get("plain_text", "") for t in ds.get("title", [])) or "（未命名資料庫）"
         out.append((ds["id"], title))
     return out
+
+
+NOTES_DB_TITLE = "課堂筆記"
+
+
+def _page_title(page: dict) -> str:
+    prop = next((p for p in page.get("properties", {}).values() if p["type"] == "title"), None)
+    return "".join(t.get("plain_text", "") for t in prop["title"]) if prop else "（未命名頁面）"
+
+
+def find_shared_pages(token: str) -> list[tuple[str, str]]:
+    """列出直接分享給 integration 的最上層頁面（例如 NEOMA），回傳 [(page_id, 標題)]。"""
+    res = _client(token).search(filter={"property": "object", "value": "page"}, page_size=100)
+    pages = res.get("results", [])
+    ids = {p["id"] for p in pages}
+    # 父頁面也在清單裡的是子頁面；資料庫裡的頁面（例如傳上去的筆記）也不算，都不列出來
+    return [(p["id"], _page_title(p)) for p in pages
+            if p["parent"]["type"] in ("workspace", "page_id", "block_id") and p["parent"].get("page_id") not in ids]
+
+
+def create_notes_database(token: str, page_id: str) -> str:
+    """在指定頁面裡建立「課堂筆記」資料庫，回傳 data_source_id。"""
+    db = _client(token).databases.create(
+        parent={"type": "page_id", "page_id": page_id},
+        title=[{"type": "text", "text": {"content": NOTES_DB_TITLE}}],
+        initial_data_source={"properties": {"名稱": {"title": {}}, COURSE_PROP: {"select": {}},
+                                            DATE_PROP: {"date": {}}}},
+    )
+    return db["data_sources"][0]["id"]
+
+
+def find_notes_database(token: str) -> Optional[str]:
+    """
+    找名稱有「筆記」的資料庫，回傳 data_source_id；沒有就回傳 None。
+    剛建立的資料庫要過一陣子才搜尋得到，所以也直接看分享頁面（例如 NEOMA）底下有沒有，
+    避免每次都重新建立一個。
+    """
+    found = next((ds_id for ds_id, title in find_databases(token) if "筆記" in title), None)
+    if found:
+        return found
+    client = _client(token)
+    for page_id, _ in find_shared_pages(token):
+        cursor = None
+        while True:
+            res = client.blocks.children.list(block_id=page_id, page_size=100,
+                                              **({"start_cursor": cursor} if cursor else {}))
+            for b in res["results"]:
+                if b["type"] == "child_database" and "筆記" in b["child_database"]["title"]:
+                    return client.databases.retrieve(database_id=b["id"])["data_sources"][0]["id"]
+            if not res.get("has_more"):
+                break
+            cursor = res["next_cursor"]
+    return None
 
 
 def _ensure_properties(client, ds_id: str) -> str:
