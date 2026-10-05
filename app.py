@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,8 @@ from pathlib import Path
 import streamlit as st
 
 from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
-                  LiveSession, SessionConfig, TermBook, fmt_time, generate_notes, list_input_devices)
+                  LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
+                  fmt_time, generate_notes, list_input_devices, merge_terms)
 
 APP_DIR = Path(__file__).parent
 RECORDS_DIR = APP_DIR / "records"
@@ -42,6 +44,18 @@ def safe_name(s: str) -> str:
 def load_fixed_terms(course: str) -> dict[str, str]:
     """讀取這門課修正過的譯名（專有名詞/課程名稱.json）。"""
     f = TERMS_DIR / f"{safe_name(course)}.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except ValueError:
+        return {}
+
+
+SLIDES_FILE = "簡報重點.json"
+
+
+def load_slides_info(out_dir: Path) -> dict:
+    """讀取這堂課開始錄音時存下的簡報重點（課程背景＋專有名詞）。"""
+    f = out_dir / SLIDES_FILE
     try:
         return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
     except ValueError:
@@ -79,6 +93,29 @@ with st.sidebar:
     if not api_key:
         st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     course = st.text_input("課程名稱", placeholder="例如：Strategies in the arts")
+
+    # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
+    slides_file = st.file_uploader("上課簡報（選填，PDF 或 PPTX）", type=["pdf", "pptx"],
+                                   help="上課前先上傳，翻譯會依照這堂課的領域用詞，並自動採用簡報裡專有名詞的通用譯名")
+    slides = None
+    if slides_file is not None:
+        data = slides_file.getvalue()
+        digest = hashlib.sha256(data).hexdigest()
+        cached = st.session_state.get("slides")
+        if cached and cached["digest"] == digest:
+            slides = cached
+        elif api_key:
+            with st.spinner("讀取簡報中…（約 10 秒）"):
+                try:
+                    brief, terms = analyze_slides(api_key, extract_slide_text(slides_file.name, data))
+                    slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms}
+                    st.session_state.slides = slides
+                except Exception as e:
+                    st.warning(f"讀不了這份簡報：{e}")
+        if slides:
+            st.caption(f"📖 {slides['summary']}")
+            with st.expander(f"從簡報找到 {len(slides['terms'])} 個專有名詞"):
+                st.markdown("\n".join(f"- {en} → {zh}" for en, zh in slides["terms"].items()) or "（沒有）")
 
     source = st.radio("音訊來源", ["麥克風", "音訊檔（模擬上課）"], horizontal=True)
     device, wav_path, wav_speed = None, None, 1.0
@@ -132,8 +169,14 @@ if c1.button("▶ 開始", type="primary", disabled=running, use_container_width
                             stt_model=stt_model, translate_model=trans_model,
                             target_delay_ms=None if delay_opt == "預設" else int(delay_opt),
                             input_device=device, wav_path=wav_path, wav_speed=wav_speed,
-                            min_chars=min_chars, fixed_terms=load_fixed_terms(course))
+                            min_chars=min_chars, fixed_terms=load_fixed_terms(course),
+                            slide_brief=slides["summary"] if slides else "",
+                            slide_terms=slides["terms"] if slides else {})
         ss.session = LiveSession(cfg)
+        if slides:   # 存一份，之後從舊逐字稿產生筆記時也能用
+            (out_dir / SLIDES_FILE).write_text(json.dumps(
+                {"name": slides["name"], "summary": slides["summary"], "terms": slides["terms"]},
+                ensure_ascii=False, indent=2), encoding="utf-8")
         ss.notes = ss.notes_path = None
         ss.session.start()
         st.rerun()
@@ -142,13 +185,14 @@ if c2.button("⏹ 停止", disabled=not running, use_container_width=True):
     sess.stop()
     st.rerun()
 
-def make_notes(transcript: str, course: str, date_str: str, out_dir: Path, fixed_terms: dict[str, str]):
+def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
+               glossary: dict[str, str], background: str):
     """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
     cache_dir = out_dir / ".筆記暫存"
     with st.status("產生筆記中…", expanded=True) as box:
         try:
             notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
-                                   progress=box.write, cache_dir=cache_dir, glossary=fixed_terms)
+                                   progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background)
             path = out_dir / "筆記.md"
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -164,7 +208,9 @@ if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=Tru
         st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
-                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir, sess.terms.fixed())
+                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir,
+                   merge_terms(sess.cfg.slide_terms, sess.terms.fixed()),
+                   fix_brief(sess.cfg.slide_brief, sess.cfg.slide_terms, sess.terms.fixed()))
 
 # 程式當掉、關掉後，也能用 records/ 裡存好的逐字稿產生筆記
 saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
@@ -183,8 +229,10 @@ with st.expander("📂 從之前的逐字稿產生筆記"):
                 # 資料夾名稱格式：日期_時間_課程名稱
                 date_str, _, rest = pick.name.partition("_")
                 course_name = rest.partition("_")[2]
-                make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"),
-                           course_name, date_str, pick, load_fixed_terms(course_name))
+                info = load_slides_info(pick)
+                slide_terms, fixed = info.get("terms", {}), load_fixed_terms(course_name)
+                make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"), course_name, date_str, pick,
+                           merge_terms(slide_terms, fixed), fix_brief(info.get("summary", ""), slide_terms, fixed))
 
 
 @st.fragment(run_every=1.0)

@@ -35,6 +35,7 @@ REALTIME_PRICE_PER_MIN = 0.006   # 美元／分鐘（2026 年官方公告價格�
 DEFAULT_STT_MODEL = "voxtral-mini-transcribe-realtime-2602"
 DEFAULT_TRANSLATE_MODEL = "mistral-small-latest"
 DEFAULT_NOTES_MODEL = "mistral-medium-latest"
+DEFAULT_SLIDES_MODEL = "mistral-large-latest"   # 讀簡報只跑一次，用最強的模型
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +199,45 @@ def glossary_prompt(glossary: dict[str, str]) -> str:
     if not glossary:
         return ""
     lines = "\n".join(f"{en} = {zh}" for en, zh in glossary.items())
-    return ("\n\n確認過的譯名：原文是同樣意思時，一定要使用這裡的中文譯名；"
+    return ("\n\n確認過的譯名（只是譯名對照，不是課堂內容）：原文是同樣意思時，一定要使用這裡的中文譯名；"
             "只有在原文明顯是另一個意思時（例如同一個字當一般用語），才依前後文翻譯。\n" + lines)
 
 
-def build_translate_messages(context: str, text: str, glossary: Optional[dict[str, str]] = None) -> list[dict]:
+def background_prompt(brief: str) -> str:
+    """把從簡報整理出的課程背景加到系統提示後面。"""
+    if not brief.strip():
+        return ""
+    return (f"\n\n這堂課的背景（從上課簡報整理，只用來判斷領域和用詞，不是課堂內容）：{brief.strip()}\n"
+            "用詞請依照這個領域的習慣；專有名詞的譯名以「確認過的譯名」為準。")
+
+
+def merge_terms(suggested: dict[str, str], fixed: dict[str, str]) -> dict[str, str]:
+    """合併簡報譯名和使用者修正的譯名；原文不分大小寫，使用者修正的優先。"""
+    merged = {en.lower(): (en, zh) for en, zh in suggested.items()}
+    merged.update({en.lower(): (en, zh) for en, zh in fixed.items()})
+    return dict(merged.values())
+
+
+def fix_brief(brief: str, suggested: dict[str, str], fixed: dict[str, str]) -> str:
+    """課程背景裡如果用了被使用者修正掉的舊譯名，換成新譯名。"""
+    old = {en.lower(): zh for en, zh in suggested.items()}
+    for en, zh in fixed.items():
+        if old.get(en.lower()) and old[en.lower()] != zh:
+            brief = brief.replace(old[en.lower()], zh)
+    return brief
+
+
+def terms_in(text: str, terms: dict[str, str]) -> dict[str, str]:
+    """只留原文有出現在 text 裡的名詞。"""
+    low = text.lower()
+    return {en: zh for en, zh in terms.items() if en.lower() in low}
+
+
+def build_translate_messages(context: str, text: str, glossary: Optional[dict[str, str]] = None,
+                             background: str = "") -> list[dict]:
     user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{text}"
-    return [{"role": "system", "content": TRANSLATE_SYSTEM + glossary_prompt(glossary or {})},
-            {"role": "user", "content": user}]
+    system = TRANSLATE_SYSTEM + background_prompt(background) + glossary_prompt(glossary or {})
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def parse_translation(raw: str) -> tuple[str, list[tuple[str, str]]]:
@@ -227,9 +259,12 @@ class TermBook:
     沒修正過的也會在之後的翻譯沿用，讓同一個名詞前後譯名一致。
     """
 
-    def __init__(self, fixed: Optional[dict[str, str]] = None):
+    def __init__(self, fixed: Optional[dict[str, str]] = None, suggested: Optional[dict[str, str]] = None):
+        """fixed：使用者修正過的譯名；suggested：從簡報找到的譯名（使用者修正的優先）。"""
         self.lock = threading.Lock()
         self._terms: dict[str, dict] = {}       # key = 原文小寫
+        for en, zh in (suggested or {}).items():
+            self.add_seen(en, zh)
         for en, zh in (fixed or {}).items():
             self.fix(en, zh)
 
@@ -271,6 +306,8 @@ class SessionConfig:
     wav_speed: float = 1.0                   # 模擬播放速度
     min_chars: int = 80
     fixed_terms: dict = field(default_factory=dict)   # 使用者修正過的譯名 {原文: 中文}
+    slide_brief: str = ""                              # 從簡報整理的課程背景
+    slide_terms: dict = field(default_factory=dict)   # 從簡報找到的譯名 {原文: 中文}
     max_reconnects: int = 5
 
 
@@ -296,7 +333,7 @@ class LiveSession:
         self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
         self.source_path = cfg.out_dir / "逐字稿_原文.txt"
         self._written_upto = 0
-        self.terms = TermBook(cfg.fixed_terms)
+        self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
 
     # ----- 對外介面 -----
     def start(self):
@@ -501,8 +538,9 @@ class LiveSession:
             for attempt in range(3):
                 try:
                     glossary = self.terms.relevant(f"{context} {seg.source}")
+                    brief = fix_brief(self.cfg.slide_brief, self.cfg.slide_terms, self.terms.fixed())
                     resp = await self._client_chat(client, self.cfg.translate_model,
-                                                   build_translate_messages(context, seg.source, glossary),
+                                                   build_translate_messages(context, seg.source, glossary, brief),
                                                    temperature=0.2, response_format={"type": "json_object"})
                     text, terms = parse_translation(_message_text(resp))
                     for en, zh in terms:
@@ -545,7 +583,8 @@ NOTES_CHUNK_SYSTEM = (
     "你是研究生的上課筆記助理。以下是一段課堂語音辨識逐字稿（英文或法文，含時間戳）。"
     "請用繁體中文（台灣用語）整理這一段的詳細筆記。\n"
     "要求：\n"
-    "- 只根據逐字稿內容，不要加入逐字稿沒有的資訊；聽不清楚或不確定的地方標註「（逐字稿不清楚）」。\n"
+    "- 只根據逐字稿內容，不要加入逐字稿沒有的資訊（課程背景和譯名對照只用來決定用詞）；"
+    "聽不清楚或不確定的地方標註「（逐字稿不清楚）」。\n"
     "- 依主題分小節，保留老師舉的例子、數字、人名、理論名稱（附原文）。\n"
     "- 老師提到的作業、考試、截止日、課前準備，全部列出並附時間戳。\n"
     "- 最後列出這段出現的專有名詞（原文｜中文｜一句話解釋）。\n"
@@ -562,7 +601,8 @@ NOTES_MERGE_SYSTEM = (
     "## 三、作業／考試／課前準備／重要提醒（附時間戳；沒有就寫「本堂課未提到」）\n"
     "## 四、專有名詞表（表格：原文｜中文｜解釋）\n"
     "## 五、逐字稿中不清楚、需要再確認的地方\n"
-    "規則：只根據提供的內容，不要自行補充；重複內容要合併，不要遺漏。\n"
+    "規則：只根據提供的內容，不要自行補充；重複內容要合併，不要遺漏。"
+    "課程背景和譯名對照只用來決定用詞，裡面有但逐字稿沒講到的東西不要寫進筆記。\n"
     "同一個專有名詞全篇只用一種譯名；各段譯名不同時，選學術界通用的那個，不確定就保留原文。"
 )
 
@@ -588,11 +628,11 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                    model: str = DEFAULT_NOTES_MODEL, client=None,
                    progress: Optional[Callable[[str], None]] = None,
                    cache_dir: Optional[Path] = None, retries: int = 4,
-                   glossary: Optional[dict[str, str]] = None) -> str:
+                   glossary: Optional[dict[str, str]] = None, background: str = "") -> str:
     """
     分段整理逐字稿，再合併成一份筆記。
     cache_dir：每段整理好就先存檔；中途失敗後再按一次，已完成的段落直接沿用，不會重複扣費。
-    glossary：使用者修正過的譯名，筆記裡一定照用。
+    glossary：要照用的譯名（使用者修正過的、從簡報找到的）。background：從簡報整理的課程背景。
     """
     if client is None:
         from mistralai.client import Mistral
@@ -617,8 +657,10 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                 say(f"⚠️ 請求失敗，{wait} 秒後重試（第 {attempt + 1} 次）：{e}")
                 time.sleep(wait)
 
-    chunk_system = NOTES_CHUNK_SYSTEM + glossary_prompt(glossary or {})
-    merge_system = NOTES_MERGE_SYSTEM + glossary_prompt(glossary or {})
+    # 只給逐字稿裡真的出現過的名詞，避免模型把簡報上的名詞當成上課內容寫進筆記
+    extra = background_prompt(background) + glossary_prompt(terms_in(transcript, glossary or {}))
+    chunk_system = NOTES_CHUNK_SYSTEM + extra
+    merge_system = NOTES_MERGE_SYSTEM + extra
 
     def cache_file(chunk: str) -> Optional[Path]:
         if cache_dir is None:
@@ -643,3 +685,54 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
     say("合併成完整筆記…")
     joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
     return _tidy_markdown(ask(merge_system, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}"))
+
+
+# ---------------------------------------------------------------------------
+# 6. 上課前讀簡報：整理課程背景和專有名詞
+# ---------------------------------------------------------------------------
+SLIDES_SYSTEM = (
+    "你是大學課程助教。以下是一堂課的簡報文字（英文或法文）。用 JSON 回覆，格式：\n"
+    "{\"summary\": \"…\", \"terms\": [{\"en\": \"原文\", \"zh\": \"繁體中文譯名\"}]}\n"
+    "summary：用繁體中文（台灣用語）2–3 句說明這堂課的學科領域、主題和重點概念。\n"
+    "terms：列出簡報裡的專有名詞、理論、概念、人名、機構名，最多 80 個。規則：\n"
+    "- 只列完整的專業名詞（例如 merit goods、arm's length principle），不要列 board、goods 這種一般單字\n"
+    "- zh 用台灣學術界通用的譯名；人名、機構名沒有通用譯名就保留原文；不確定的也保留原文，不要自己創造譯名"
+)
+SLIDES_MAX_CHARS = 40000
+
+
+def extract_slide_text(filename: str, data: bytes) -> str:
+    """從 PDF 或 PPTX 簡報取出文字。"""
+    import io
+    name = filename.lower()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        pages = PdfReader(io.BytesIO(data)).pages
+        return "\n\n".join(f"[第 {i} 頁]\n{p.extract_text() or ''}" for i, p in enumerate(pages, 1))
+    if name.endswith(".pptx"):
+        from pptx import Presentation
+        out = []
+        for i, slide in enumerate(Presentation(io.BytesIO(data)).slides, 1):
+            texts = [sh.text_frame.text for sh in slide.shapes if sh.has_text_frame and sh.text_frame.text.strip()]
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
+                texts.append("備註：" + slide.notes_slide.notes_text_frame.text)
+            out.append(f"[第 {i} 頁]\n" + "\n".join(texts))
+        return "\n\n".join(out)
+    raise ValueError("只支援 PDF 或 PPTX 檔")
+
+
+def analyze_slides(api_key: str, text: str, model: str = DEFAULT_SLIDES_MODEL,
+                   client=None) -> tuple[str, dict[str, str]]:
+    """讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}）。"""
+    if not text.strip():
+        raise ValueError("簡報裡讀不到文字（可能是掃描圖片檔）")
+    if client is None:
+        from mistralai.client import Mistral
+        client = Mistral(api_key=api_key)
+    resp = client.chat.complete(model=model, temperature=0.1, response_format={"type": "json_object"},
+                                messages=[{"role": "system", "content": SLIDES_SYSTEM},
+                                          {"role": "user", "content": text[:SLIDES_MAX_CHARS]}])
+    data = json.loads(_message_text(resp))
+    terms = {str(t["en"]).strip(): str(t["zh"]).strip() for t in data.get("terms") or []
+             if isinstance(t, dict) and t.get("en") and t.get("zh")}
+    return str(data.get("summary", "")).strip(), terms
