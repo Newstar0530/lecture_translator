@@ -263,7 +263,7 @@ st.html("""<style>
 .st-key-grp_class::before, .st-key-grp_audio::before, .st-key-grp_terms::before {
   content:""; position:absolute; top:-1px; left:18px; width:42px; height:3px; border-radius:3px;
   background: var(--c); box-shadow: 0 0 12px var(--c); }
-.st-key-grp_audio h4, .st-key-grp_terms h4 { color: var(--c); padding-top: .1rem; }
+.st-key-grp_class h4, .st-key-grp_audio h4, .st-key-grp_terms h4 { color: var(--c); padding-top: .1rem; }
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .9rem; }
 
 /* 系統設定「減少動態效果」時全部關掉 */
@@ -297,8 +297,9 @@ with st.sidebar:
     if not api_key:
         st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
 
-    # 第一組：這堂課（課程名稱＋簡報）
+    # 第一組：Lecture information（課程名稱＋簡報）
     with st.container(key="grp_class"):
+        st.markdown("#### Lecture information")
         course = st.text_input("Course name")
 
         # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
