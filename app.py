@@ -160,7 +160,7 @@ st.html("""<style>
 /* ---------- 酷炫版 ---------- */
 /* 極光背景：藍紫色光暈在深色背景後面緩慢飄動 */
 [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] { background: transparent !important; }
-[data-testid="stAppViewContainer"] { position: relative; z-index: 1; }
+[data-testid="stAppViewContainer"] { z-index: 1; }   /* 只調圖層，不能改 position，否則整頁會變得不能捲動 */
 .stApp::before { content:""; position:fixed; inset:-25%; z-index:0; pointer-events:none;
   background:
     radial-gradient(38% 32% at 22% 18%, rgba(110,168,254,.34), transparent 70%),
