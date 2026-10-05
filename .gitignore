@@ -1,0 +1,4 @@
+.env
+records/
+.venv/
+__pycache__/

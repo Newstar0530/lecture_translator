@@ -1,0 +1,510 @@
+"""
+即時上課翻譯＋筆記：核心邏輯（不含介面）
+
+流程：
+    麥克風 / 音訊檔
+      → Voxtral Realtime（語音轉文字，串流）
+      → 斷句（SentenceBuffer）
+      → Mistral LLM 翻譯成繁體中文
+      → 顯示在 Streamlit，並即時存檔
+    下課後：
+      → 把整堂逐字稿分段整理，產生 Markdown 筆記
+"""
+from __future__ import annotations
+
+import asyncio
+import queue as thread_queue
+import re
+import threading
+import time
+import wave
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import AsyncIterator, Callable, Optional
+
+import numpy as np
+
+SAMPLE_RATE = 16000          # Voxtral Realtime 需要 16 kHz、單聲道、16-bit PCM
+CHUNK_MS = 100               # 每次送出 100 毫秒的音訊
+CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
+REALTIME_PRICE_PER_MIN = 0.006   # 美元／分鐘（2026 年官方公告價格，可能變動）
+
+DEFAULT_STT_MODEL = "voxtral-mini-transcribe-realtime-2602"
+DEFAULT_TRANSLATE_MODEL = "mistral-small-latest"
+DEFAULT_NOTES_MODEL = "mistral-medium-latest"
+
+
+# ---------------------------------------------------------------------------
+# 1. 斷句：把串流進來的零碎文字，組成適合翻譯的句子
+# ---------------------------------------------------------------------------
+_SENTENCE_END = re.compile(r"[.!?…。！？](?:[\"'”’)\]]*)\s")
+
+
+class SentenceBuffer:
+    """
+    規則：
+    - 遇到句尾標點（. ! ? …）而且後面接了空白，而且累積長度 >= min_chars → 送出
+    - 累積超過 max_chars 還沒有句尾 → 在最後一個逗號或空白處切開送出
+    - 一段時間沒有新文字（idle_seconds）→ 把剩下的送出（由外部呼叫 flush_if_idle）
+    min_chars 可以把太短的句子合併，減少翻譯請求次數。
+    """
+
+    def __init__(self, min_chars: int = 80, max_chars: int = 320, idle_seconds: float = 3.0):
+        self.min_chars = min_chars
+        self.max_chars = max_chars
+        self.idle_seconds = idle_seconds
+        self.buf = ""
+        self.last_update = time.monotonic()
+
+    def add(self, text: str) -> list[str]:
+        self.buf += text
+        self.last_update = time.monotonic()
+        out: list[str] = []
+        while True:
+            cut = self._find_cut()
+            if cut is None:
+                break
+            piece, self.buf = self.buf[:cut].strip(), self.buf[cut:].lstrip()
+            if piece:
+                out.append(piece)
+        return out
+
+    def _find_cut(self) -> Optional[int]:
+        # 找「長度已經夠」之後的第一個句尾
+        for m in _SENTENCE_END.finditer(self.buf):
+            if m.end() >= self.min_chars:
+                return m.end()
+        # 太長了：在逗號或空白處切
+        if len(self.buf) > self.max_chars:
+            window = self.buf[: self.max_chars]
+            for sep in (", ", "; ", ": ", " "):
+                pos = window.rfind(sep)
+                if pos > self.max_chars // 2:
+                    return pos + len(sep)
+            return self.max_chars
+        return None
+
+    def flush_if_idle(self, now: Optional[float] = None) -> Optional[str]:
+        now = time.monotonic() if now is None else now
+        if self.buf.strip() and now - self.last_update >= self.idle_seconds:
+            return self.flush()
+        return None
+
+    def flush(self) -> Optional[str]:
+        piece, self.buf = self.buf.strip(), ""
+        return piece or None
+
+    @property
+    def pending(self) -> str:
+        return self.buf
+
+
+# ---------------------------------------------------------------------------
+# 2. 資料結構
+# ---------------------------------------------------------------------------
+@dataclass
+class Segment:
+    idx: int
+    elapsed: float            # 開始錄音後幾秒
+    source: str               # 原文
+    translation: Optional[str] = None   # None = 翻譯中
+    error: Optional[str] = None
+
+
+def fmt_time(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def _message_text(resp) -> str:
+    """從 chat.complete 的回應取出文字（content 可能是字串或多段）。"""
+    content = resp.choices[0].message.content
+    if isinstance(content, str):
+        return content.strip()
+    parts = []
+    for c in content or []:
+        t = getattr(c, "text", None)
+        if t is None and isinstance(c, dict):
+            t = c.get("text")
+        if t:
+            parts.append(t)
+    return "".join(parts).strip()
+
+
+# ---------------------------------------------------------------------------
+# 3. 音訊來源
+# ---------------------------------------------------------------------------
+def load_wav_as_pcm16(path: str | Path) -> bytes:
+    """讀 WAV 檔，轉成 16 kHz、單聲道、16-bit PCM（模擬上課用）。"""
+    with wave.open(str(path), "rb") as w:
+        n_ch, width, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    if width != 2:
+        raise ValueError("只支援 16-bit PCM 的 WAV 檔")
+    data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if n_ch > 1:
+        data = data.reshape(-1, n_ch).mean(axis=1)
+    if rate != SAMPLE_RATE:
+        new_len = int(len(data) * SAMPLE_RATE / rate)
+        data = np.interp(np.linspace(0, len(data) - 1, new_len), np.arange(len(data)), data)
+    return np.clip(data, -32768, 32767).astype(np.int16).tobytes()
+
+
+def list_input_devices() -> list[tuple[int, str]]:
+    import sounddevice as sd
+    return [(i, d["name"]) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+
+
+# ---------------------------------------------------------------------------
+# 4. 即時翻譯 Session（在背景執行緒跑自己的 asyncio 迴圈）
+# ---------------------------------------------------------------------------
+TRANSLATE_SYSTEM = (
+    "你是大學課堂的即時口譯員。把使用者給的課堂逐字稿片段（英文或法文）翻譯成自然、準確的繁體中文（台灣用語）。\n"
+    "規則：\n"
+    "1. 只輸出翻譯，不要加解釋、不要加引號、不要重複原文。\n"
+    "2. 專有名詞、人名、理論名稱第一次出現時保留原文在括號內，例如：轉換型領導（transformational leadership）。\n"
+    "3. 逐字稿是語音辨識結果，可能有錯字或斷句不完整；照字面合理翻譯，不要自行補充原文沒有的內容。\n"
+    "4. 「前文」只是幫助你理解上下文，不要翻譯前文。"
+)
+
+
+@dataclass
+class SessionConfig:
+    api_key: str
+    out_dir: Path
+    course: str = ""
+    stt_model: str = DEFAULT_STT_MODEL
+    translate_model: str = DEFAULT_TRANSLATE_MODEL
+    target_delay_ms: Optional[int] = None
+    input_device: Optional[int] = None       # None = 系統預設麥克風
+    wav_path: Optional[str] = None           # 有值 = 用音訊檔模擬
+    wav_speed: float = 1.0                   # 模擬播放速度
+    min_chars: int = 80
+    max_reconnects: int = 5
+
+
+class LiveSession:
+    def __init__(self, cfg: SessionConfig, client_factory: Optional[Callable] = None):
+        self.cfg = cfg
+        self._client_factory = client_factory
+        self.lock = threading.Lock()
+        self.segments: list[Segment] = []
+        self.partial = ""
+        self.language: Optional[str] = None
+        self.status = "尚未開始"
+        self.errors: list[str] = []
+        self.started_at: Optional[float] = None
+        self.ended_at: Optional[float] = None
+        self.audio_seconds = 0.0
+        self.running = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._buffer = SentenceBuffer(min_chars=cfg.min_chars)
+        self._audio_q: "thread_queue.Queue[bytes]" = thread_queue.Queue()
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
+        self.source_path = cfg.out_dir / "逐字稿_原文.txt"
+        self._written_upto = 0
+
+    # ----- 對外介面 -----
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._stop.clear()
+        self.started_at = time.time()
+        with open(self.transcript_path, "w", encoding="utf-8") as f:
+            title = self.cfg.course or "上課逐字稿"
+            f.write(f"# {title}\n\n錄音開始：{datetime.now():%Y-%m-%d %H:%M}\n\n")
+        self.source_path.write_text("", encoding="utf-8")
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._set_status("停止中…（等待最後的辨識和翻譯）")
+
+    def join(self, timeout: Optional[float] = None):
+        if self._thread:
+            self._thread.join(timeout)
+
+    def elapsed(self) -> float:
+        if not self.started_at:
+            return 0.0
+        return (self.ended_at or time.time()) - self.started_at
+
+    def est_cost(self) -> float:
+        return self.audio_seconds / 60 * REALTIME_PRICE_PER_MIN
+
+    def snapshot(self):
+        with self.lock:
+            return (list(self.segments), self._buffer.pending, self.status, list(self.errors), self.language)
+
+    def full_source_text(self) -> str:
+        with self.lock:
+            return "\n".join(f"[{fmt_time(s.elapsed)}] {s.source}" for s in self.segments)
+
+    # ----- 內部 -----
+    def _set_status(self, s: str):
+        with self.lock:
+            self.status = s
+
+    def _log_error(self, msg: str):
+        with self.lock:
+            self.errors.append(f"{datetime.now():%H:%M:%S} {msg}")
+
+    def _make_client(self):
+        if self._client_factory:
+            return self._client_factory(self.cfg.api_key)
+        from mistralai.client import Mistral
+        return Mistral(api_key=self.cfg.api_key)
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._main())
+        except Exception as e:  # 最後防線
+            self._log_error(f"程式錯誤：{e!r}")
+        finally:
+            self.running = False
+            self.ended_at = time.time()
+            self._set_status("已停止")
+
+    async def _main(self):
+        client = self._make_client()
+        self._trans_q: asyncio.Queue = asyncio.Queue()
+        producer = threading.Thread(target=self._audio_producer, daemon=True)
+        producer.start()
+        translator = asyncio.create_task(self._translator(client))
+        idle = asyncio.create_task(self._idle_flusher())
+        stt = asyncio.create_task(self._stt_loop(client))
+        stop_seen: Optional[float] = None
+        try:
+            # 按下停止後，最多等 20 秒讓伺服器送回最後的辨識結果
+            while not stt.done():
+                await asyncio.sleep(0.2)
+                if self._stop.is_set():
+                    stop_seen = stop_seen or time.monotonic()
+                    if time.monotonic() - stop_seen > 20:
+                        stt.cancel()
+                        break
+            try:
+                await stt
+            except asyncio.CancelledError:
+                pass
+        finally:
+            idle.cancel()
+            rest = self._buffer.flush()
+            if rest:
+                self._add_segment(rest)
+            await self._trans_q.put(None)       # 通知翻譯結束
+            await translator
+            self._write_pending()
+
+    # 音訊：麥克風或檔案 → thread queue
+    def _audio_producer(self):
+        try:
+            if self.cfg.wav_path:
+                pcm = load_wav_as_pcm16(self.cfg.wav_path)
+                step = CHUNK_SAMPLES * 2
+                for i in range(0, len(pcm), step):
+                    if self._stop.is_set():
+                        break
+                    self._audio_q.put(pcm[i:i + step])
+                    time.sleep(CHUNK_MS / 1000 / max(self.cfg.wav_speed, 0.1))
+                self._stop.set()     # 檔案播完就自動停止
+            else:
+                import sounddevice as sd
+
+                def cb(indata, frames, t, status):
+                    self._audio_q.put(bytes(indata))
+
+                with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                       blocksize=CHUNK_SAMPLES, device=self.cfg.input_device,
+                                       callback=cb):
+                    while not self._stop.is_set():
+                        time.sleep(0.1)
+        except Exception as e:
+            self._log_error(f"收音失敗：{e}")
+            self._stop.set()
+
+    async def _audio_stream(self) -> AsyncIterator[bytes]:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                chunk = await loop.run_in_executor(None, self._audio_q.get, True, 0.2)
+            except thread_queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            self.audio_seconds += len(chunk) / 2 / SAMPLE_RATE
+            yield chunk
+
+    async def _stt_loop(self, client):
+        from mistralai.client.models import (AudioFormat, RealtimeTranscriptionError,
+                                             TranscriptionStreamDone, TranscriptionStreamLanguage,
+                                             TranscriptionStreamTextDelta)
+        fmt = AudioFormat(encoding="pcm_s16le", sample_rate=SAMPLE_RATE)
+        failures = 0
+        while True:
+            self._set_status("連線中…")
+            try:
+                kwargs = dict(audio_stream=self._audio_stream(), model=self.cfg.stt_model, audio_format=fmt)
+                if self.cfg.target_delay_ms:
+                    kwargs["target_streaming_delay_ms"] = self.cfg.target_delay_ms
+                async for ev in client.audio.realtime.transcribe_stream(**kwargs):
+                    if isinstance(ev, TranscriptionStreamTextDelta):
+                        failures = 0
+                        if not self._stop.is_set():
+                            self._set_status("🔴 錄音中")
+                        with self.lock:
+                            pieces = self._buffer.add(ev.text)
+                        for p in pieces:
+                            self._add_segment(p)
+                    elif isinstance(ev, TranscriptionStreamLanguage):
+                        with self.lock:
+                            self.language = ev.audio_language
+                    elif isinstance(ev, TranscriptionStreamDone):
+                        break
+                    elif isinstance(ev, RealtimeTranscriptionError):
+                        msg = ev.error.message
+                        self._log_error(f"語音辨識錯誤：{getattr(msg, 'detail', msg)}")
+                    elif getattr(ev, "type", None) in ("session.created", "session.updated"):
+                        if not self._stop.is_set():
+                            self._set_status("🔴 錄音中")
+            except Exception as e:
+                failures += 1
+                self._log_error(f"連線中斷（第 {failures} 次）：{e}")
+                if failures > self.cfg.max_reconnects:
+                    self._log_error("重連次數太多，停止錄音。逐字稿已存檔。")
+                    self._stop.set()
+                    return
+                await asyncio.sleep(min(2 * failures, 10))
+            if self._stop.is_set():
+                return
+            # 伺服器結束了這次連線但使用者沒按停止 → 自動重連
+
+    async def _idle_flusher(self):
+        while True:
+            await asyncio.sleep(0.5)
+            with self.lock:
+                piece = self._buffer.flush_if_idle()
+            if piece:
+                self._add_segment(piece)
+
+    def _add_segment(self, text: str):
+        with self.lock:
+            seg = Segment(idx=len(self.segments), elapsed=self.audio_seconds, source=text)
+            self.segments.append(seg)
+        with open(self.source_path, "a", encoding="utf-8") as f:
+            f.write(f"[{fmt_time(seg.elapsed)}] {text}\n")
+        self._trans_q.put_nowait(seg)
+
+    async def _translator(self, client):
+        while True:
+            seg = await self._trans_q.get()
+            if seg is None:
+                return
+            with self.lock:
+                context = " ".join(s.source for s in self.segments[max(0, seg.idx - 2):seg.idx])
+            user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{seg.source}"
+            for attempt in range(3):
+                try:
+                    resp = await self._client_chat(client, self.cfg.translate_model, [
+                        {"role": "system", "content": TRANSLATE_SYSTEM},
+                        {"role": "user", "content": user},
+                    ], temperature=0.2)
+                    with self.lock:
+                        seg.translation = _message_text(resp)
+                    break
+                except Exception as e:
+                    wait = 5 * (attempt + 1) if "429" in str(e) else 1.5 * (attempt + 1)
+                    if attempt == 2:
+                        with self.lock:
+                            seg.error = f"翻譯失敗：{e}"
+                            seg.translation = ""
+                        self._log_error(f"翻譯失敗：{e}")
+                    else:
+                        await asyncio.sleep(wait)
+            self._write_pending()
+
+    @staticmethod
+    async def _client_chat(client, model, messages, **kw):
+        return await client.chat.complete_async(model=model, messages=messages, **kw)
+
+    def _write_pending(self):
+        """依序把已翻譯好的段落寫入雙語逐字稿（避免順序錯亂）。"""
+        with self.lock:
+            ready = []
+            while self._written_upto < len(self.segments) and self.segments[self._written_upto].translation is not None:
+                ready.append(self.segments[self._written_upto])
+                self._written_upto += 1
+        if ready:
+            with open(self.transcript_path, "a", encoding="utf-8") as f:
+                for s in ready:
+                    f.write(f"**[{fmt_time(s.elapsed)}]** {s.source}\n\n> {s.translation or '（翻譯失敗）'}\n\n")
+
+
+# ---------------------------------------------------------------------------
+# 5. 下課後產生筆記
+# ---------------------------------------------------------------------------
+NOTES_CHUNK_SYSTEM = (
+    "你是研究生的上課筆記助理。以下是一段課堂語音辨識逐字稿（英文或法文，含時間戳）。"
+    "請用繁體中文（台灣用語）整理這一段的詳細筆記。\n"
+    "要求：\n"
+    "- 只根據逐字稿內容，不要加入逐字稿沒有的資訊；聽不清楚或不確定的地方標註「（逐字稿不清楚）」。\n"
+    "- 依主題分小節，保留老師舉的例子、數字、人名、理論名稱（附原文）。\n"
+    "- 老師提到的作業、考試、截止日、課前準備，全部列出並附時間戳。\n"
+    "- 最後列出這段出現的專有名詞（原文｜中文｜一句話解釋）。"
+)
+
+NOTES_MERGE_SYSTEM = (
+    "你是研究生的上課筆記助理。以下是同一堂課依時間順序分段整理的筆記。"
+    "請合併成一份完整、詳細的繁體中文（台灣用語）Markdown 筆記。\n"
+    "結構：\n"
+    "# 課程名稱與日期\n"
+    "## 一、本堂課摘要（5–8 句）\n"
+    "## 二、詳細筆記（依主題分節，保留例子、數字、理論名稱原文）\n"
+    "## 三、作業／考試／課前準備／重要提醒（附時間戳；沒有就寫「本堂課未提到」）\n"
+    "## 四、專有名詞表（表格：原文｜中文｜解釋）\n"
+    "## 五、逐字稿中不清楚、需要再確認的地方\n"
+    "規則：只根據提供的內容，不要自行補充；重複內容要合併，不要遺漏。"
+)
+
+
+def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
+    lines, chunks, cur = text.splitlines(), [], ""
+    for line in lines:
+        if cur and len(cur) + len(line) + 1 > max_chars:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
+def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
+                   model: str = DEFAULT_NOTES_MODEL, client=None,
+                   progress: Optional[Callable[[str], None]] = None) -> str:
+    if client is None:
+        from mistralai.client import Mistral
+        client = Mistral(api_key=api_key)
+    say = progress or (lambda s: None)
+    chunks = chunk_text(transcript)
+    if not chunks:
+        return "（沒有逐字稿內容）"
+
+    def ask(system, user):
+        resp = client.chat.complete(model=model, temperature=0.2,
+                                    messages=[{"role": "system", "content": system},
+                                              {"role": "user", "content": user}])
+        return _message_text(resp)
+
+    partials = []
+    for i, c in enumerate(chunks, 1):
+        say(f"整理第 {i}/{len(chunks)} 段…")
+        partials.append(ask(NOTES_CHUNK_SYSTEM, c))
+    say("合併成完整筆記…")
+    joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
+    return ask(NOTES_MERGE_SYSTEM, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}")
