@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -123,19 +124,49 @@ if c2.button("⏹ 停止", disabled=not running, use_container_width=True):
     sess.stop()
     st.rerun()
 
-can_note = bool(sess and not sess.running and sess.segments)
-if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=True):
+def make_notes(transcript: str, course: str, date_str: str, out_dir: Path):
+    """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
+    cache_dir = out_dir / ".筆記暫存"
     with st.status("產生筆記中…", expanded=True) as box:
         try:
-            notes = generate_notes(api_key, sess.full_source_text(), sess.cfg.course,
-                                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}",
-                                   model=notes_model, progress=box.write)
-            path = sess.cfg.out_dir / "筆記.md"
+            notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
+                                   progress=box.write, cache_dir=cache_dir)
+            path = out_dir / "筆記.md"
             path.write_text(notes, encoding="utf-8")
+            shutil.rmtree(cache_dir, ignore_errors=True)
             ss.notes, ss.notes_path = notes, path
             box.update(label="筆記完成", state="complete")
         except Exception as e:
-            box.update(label=f"產生筆記失敗：{e}", state="error")
+            box.update(label=f"產生筆記失敗：{e}（已完成的段落有暫存，再按一次會接續）", state="error")
+
+
+can_note = bool(sess and not sess.running and sess.segments)
+if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=True):
+    if not api_key:
+        st.error("請先在左邊輸入 Mistral API Key")
+    else:
+        make_notes(sess.full_source_text(), sess.cfg.course,
+                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir)
+
+# 程式當掉、關掉後，也能用 records/ 裡存好的逐字稿產生筆記
+saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
+                and (d / "逐字稿_原文.txt").exists() and (d / "逐字稿_原文.txt").stat().st_size > 0),
+               reverse=True) if RECORDS_DIR.exists() else []
+with st.expander("📂 從之前的逐字稿產生筆記"):
+    if not saved:
+        st.caption("records/ 裡還沒有逐字稿")
+    else:
+        pick = st.selectbox("選擇課堂", saved,
+                            format_func=lambda d: d.name + ("（已有筆記）" if (d / "筆記.md").exists() else ""))
+        if st.button("📝 用這份逐字稿產生筆記", disabled=running and sess.cfg.out_dir == pick):
+            if not api_key:
+                st.error("請先在左邊輸入 Mistral API Key")
+            else:
+                # 資料夾名稱格式：日期_時間_課程名稱
+                date_str, _, rest = pick.name.partition("_")
+                course_name = rest.partition("_")[2]
+                make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"),
+                           course_name, date_str, pick)
 
 
 @st.fragment(run_every=1.0)

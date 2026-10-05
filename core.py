@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import queue as thread_queue
 import re
 import threading
@@ -486,7 +487,12 @@ def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
 
 def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                    model: str = DEFAULT_NOTES_MODEL, client=None,
-                   progress: Optional[Callable[[str], None]] = None) -> str:
+                   progress: Optional[Callable[[str], None]] = None,
+                   cache_dir: Optional[Path] = None, retries: int = 4) -> str:
+    """
+    分段整理逐字稿，再合併成一份筆記。
+    cache_dir：每段整理好就先存檔；中途失敗後再按一次，已完成的段落直接沿用，不會重複扣費。
+    """
     if client is None:
         from mistralai.client import Mistral
         client = Mistral(api_key=api_key)
@@ -496,15 +502,40 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
         return "（沒有逐字稿內容）"
 
     def ask(system, user):
-        resp = client.chat.complete(model=model, temperature=0.2,
-                                    messages=[{"role": "system", "content": system},
-                                              {"role": "user", "content": user}])
-        return _message_text(resp)
+        for attempt in range(retries):
+            try:
+                resp = client.chat.complete(model=model, temperature=0.2,
+                                            messages=[{"role": "system", "content": system},
+                                                      {"role": "user", "content": user}])
+                return _message_text(resp)
+            except Exception as e:
+                # 金鑰無效、沒有權限：重試也沒用，直接回報
+                if attempt == retries - 1 or "401" in str(e) or "403" in str(e):
+                    raise
+                wait = 10 * (attempt + 1) if "429" in str(e) else 3 * (attempt + 1)
+                say(f"⚠️ 請求失敗，{wait} 秒後重試（第 {attempt + 1} 次）：{e}")
+                time.sleep(wait)
 
+    def cache_file(chunk: str) -> Optional[Path]:
+        if cache_dir is None:
+            return None
+        key = hashlib.sha256(f"{model}\n{NOTES_CHUNK_SYSTEM}\n{chunk}".encode("utf-8")).hexdigest()[:16]
+        return cache_dir / f"{key}.md"
+
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     partials = []
     for i, c in enumerate(chunks, 1):
+        f = cache_file(c)
+        if f is not None and f.exists():
+            say(f"第 {i}/{len(chunks)} 段之前已整理過，直接沿用")
+            partials.append(f.read_text(encoding="utf-8"))
+            continue
         say(f"整理第 {i}/{len(chunks)} 段…")
-        partials.append(ask(NOTES_CHUNK_SYSTEM, c))
+        part = ask(NOTES_CHUNK_SYSTEM, c)
+        if f is not None:
+            f.write_text(part, encoding="utf-8")
+        partials.append(part)
     say("合併成完整筆記…")
     joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
     return ask(NOTES_MERGE_SYSTEM, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}")
