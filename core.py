@@ -66,36 +66,51 @@ class SentenceBuffer:
     規則：
     - 遇到句尾標點（. ! ? …）而且後面接了空白，而且累積長度 >= min_chars → 送出
       （Dr.、e.g.、J. Smith 這類縮寫的句點不算句尾）
+    - 沒有句號但已經累積 comma_seconds 秒或 comma_chars 個字元 → 在最後一個逗號處切開送出
+      （語音辨識有時整段只標逗號，不這樣做的話要等老師停下來才會翻譯）
     - 累積超過 max_chars 還沒有句尾 → 在最後一個逗號或空白處切開送出
     - 一段時間沒有新文字（idle_seconds）→ 把剩下的送出（由外部呼叫 flush_if_idle）
     min_chars 可以把太短的句子合併，減少翻譯請求次數。
     """
 
-    def __init__(self, min_chars: int = 80, max_chars: int = 320, idle_seconds: float = 3.0):
+    def __init__(self, min_chars: int = 80, max_chars: int = 320, idle_seconds: float = 3.0,
+                 comma_seconds: float = 6.0, comma_chars: int = 160):
         self.min_chars = min_chars
         self.max_chars = max_chars
         self.idle_seconds = idle_seconds
+        self.comma_seconds = comma_seconds
+        self.comma_chars = comma_chars
         self.buf = ""
         self.last_update = time.monotonic()
+        self.buf_started = self.last_update      # 目前這段開始累積的時間
 
     def add(self, text: str) -> list[str]:
+        now = time.monotonic()
+        if not self.buf.strip():
+            self.buf_started = now
         self.buf += text
-        self.last_update = time.monotonic()
+        self.last_update = now
         out: list[str] = []
         while True:
-            cut = self._find_cut()
+            cut = self._find_cut(now)
             if cut is None:
                 break
             piece, self.buf = self.buf[:cut].strip(), self.buf[cut:].lstrip()
+            self.buf_started = now
             if piece:
                 out.append(piece)
         return out
 
-    def _find_cut(self) -> Optional[int]:
+    def _find_cut(self, now: float) -> Optional[int]:
         # 找「長度已經夠」之後的第一個句尾
         for m in _SENTENCE_END.finditer(self.buf):
             if m.end() >= self.min_chars and not _is_abbreviation(self.buf, m.start()):
                 return m.end()
+        # 沒有句號、但已經等太久或太長：在最後一個逗號處切
+        if now - self.buf_started >= self.comma_seconds or len(self.buf) >= self.comma_chars:
+            pos = max(self.buf.rfind(sep) for sep in (", ", "; ", ": "))
+            if pos >= 0 and pos + 2 >= self.min_chars:
+                return pos + 2
         # 太長了：在逗號或空白處切
         if len(self.buf) > self.max_chars:
             window = self.buf[: self.max_chars]
