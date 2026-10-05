@@ -182,10 +182,26 @@ TRANSLATE_SYSTEM = (
     "你是大學課堂的即時口譯員。把使用者給的課堂逐字稿片段（英文或法文）翻譯成自然、準確的繁體中文（台灣用語）。\n"
     "規則：\n"
     "1. 只輸出翻譯，不要加解釋、不要加引號、不要重複原文。\n"
-    "2. 專有名詞、人名、理論名稱第一次出現時保留原文在括號內，例如：轉換型領導（transformational leadership）。\n"
-    "3. 逐字稿是語音辨識結果，可能有錯字或斷句不完整；照字面合理翻譯，不要自行補充原文沒有的內容。\n"
-    "4. 「前文」只是幫助你理解上下文，不要翻譯前文。"
+    "2. 片段裡的每一句都要翻譯，包括開場、轉折的短句（例如 Let's start with a simple question.、Now, compare two models.），"
+    "不可以省略、摘要或合併句子。\n"
+    "3. 專有名詞、人名、理論名稱第一次出現時保留原文在括號內，例如：轉換型領導（transformational leadership）。"
+    "只使用學術界通用的中文譯名；不確定有沒有通用譯名時，直接保留原文，不要自己創造譯名，也不要用成語或字面意思硬翻。\n"
+    "4. 逐字稿是語音辨識結果，可能有錯字或斷句不完整；照字面合理翻譯，不要自行補充原文沒有的內容。\n"
+    "5. 「前文」只是幫助你理解上下文：不要翻譯前文，也不要把前文的內容加進翻譯裡。"
 )
+
+
+def glossary_prompt(glossary: str) -> str:
+    """把使用者的課程詞彙表（每行「原文 = 中文」）加到系統提示後面。"""
+    if not glossary.strip():
+        return ""
+    return "\n\n課程詞彙表（遇到這些名詞一定要使用指定的中文譯名）：\n" + glossary.strip()
+
+
+def build_translate_messages(context: str, text: str, glossary: str = "") -> list[dict]:
+    user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{text}"
+    return [{"role": "system", "content": TRANSLATE_SYSTEM + glossary_prompt(glossary)},
+            {"role": "user", "content": user}]
 
 
 @dataclass
@@ -200,6 +216,7 @@ class SessionConfig:
     wav_path: Optional[str] = None           # 有值 = 用音訊檔模擬
     wav_speed: float = 1.0                   # 模擬播放速度
     min_chars: int = 80
+    glossary: str = ""                       # 課程詞彙表，每行「原文 = 中文」
     max_reconnects: int = 5
 
 
@@ -426,13 +443,11 @@ class LiveSession:
                 return
             with self.lock:
                 context = " ".join(s.source for s in self.segments[max(0, seg.idx - 2):seg.idx])
-            user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{seg.source}"
             for attempt in range(3):
                 try:
-                    resp = await self._client_chat(client, self.cfg.translate_model, [
-                        {"role": "system", "content": TRANSLATE_SYSTEM},
-                        {"role": "user", "content": user},
-                    ], temperature=0.2)
+                    resp = await self._client_chat(client, self.cfg.translate_model,
+                                                   build_translate_messages(context, seg.source, self.cfg.glossary),
+                                                   temperature=0.2)
                     with self.lock:
                         seg.translation = _message_text(resp)
                     break
@@ -474,7 +489,8 @@ NOTES_CHUNK_SYSTEM = (
     "- 只根據逐字稿內容，不要加入逐字稿沒有的資訊；聽不清楚或不確定的地方標註「（逐字稿不清楚）」。\n"
     "- 依主題分小節，保留老師舉的例子、數字、人名、理論名稱（附原文）。\n"
     "- 老師提到的作業、考試、截止日、課前準備，全部列出並附時間戳。\n"
-    "- 最後列出這段出現的專有名詞（原文｜中文｜一句話解釋）。"
+    "- 最後列出這段出現的專有名詞（原文｜中文｜一句話解釋）。\n"
+    "- 專有名詞只用學術界通用的中文譯名；不確定有沒有通用譯名時，中文欄直接寫原文，不要自己創造譯名，也不要用成語或字面意思硬翻。"
 )
 
 NOTES_MERGE_SYSTEM = (
@@ -487,8 +503,14 @@ NOTES_MERGE_SYSTEM = (
     "## 三、作業／考試／課前準備／重要提醒（附時間戳；沒有就寫「本堂課未提到」）\n"
     "## 四、專有名詞表（表格：原文｜中文｜解釋）\n"
     "## 五、逐字稿中不清楚、需要再確認的地方\n"
-    "規則：只根據提供的內容，不要自行補充；重複內容要合併，不要遺漏。"
+    "規則：只根據提供的內容，不要自行補充；重複內容要合併，不要遺漏。\n"
+    "同一個專有名詞全篇只用一種譯名；各段譯名不同時，選學術界通用的那個，不確定就保留原文。"
 )
+
+
+def _tidy_markdown(text: str) -> str:
+    """把模型輸出中連續重複的分隔線（---）合併成一條。"""
+    return re.sub(r"(?:^---[ \t]*\n\s*){2,}", "---\n\n", text, flags=re.M)
 
 
 def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
@@ -506,7 +528,7 @@ def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
 def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                    model: str = DEFAULT_NOTES_MODEL, client=None,
                    progress: Optional[Callable[[str], None]] = None,
-                   cache_dir: Optional[Path] = None, retries: int = 4) -> str:
+                   cache_dir: Optional[Path] = None, retries: int = 4, glossary: str = "") -> str:
     """
     分段整理逐字稿，再合併成一份筆記。
     cache_dir：每段整理好就先存檔；中途失敗後再按一次，已完成的段落直接沿用，不會重複扣費。
@@ -534,10 +556,12 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                 say(f"⚠️ 請求失敗，{wait} 秒後重試（第 {attempt + 1} 次）：{e}")
                 time.sleep(wait)
 
+    chunk_system = NOTES_CHUNK_SYSTEM + glossary_prompt(glossary)
+
     def cache_file(chunk: str) -> Optional[Path]:
         if cache_dir is None:
             return None
-        key = hashlib.sha256(f"{model}\n{NOTES_CHUNK_SYSTEM}\n{chunk}".encode("utf-8")).hexdigest()[:16]
+        key = hashlib.sha256(f"{model}\n{chunk_system}\n{chunk}".encode("utf-8")).hexdigest()[:16]
         return cache_dir / f"{key}.md"
 
     if cache_dir is not None:
@@ -550,10 +574,10 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
             partials.append(f.read_text(encoding="utf-8"))
             continue
         say(f"整理第 {i}/{len(chunks)} 段…")
-        part = ask(NOTES_CHUNK_SYSTEM, c)
+        part = ask(chunk_system, c)
         if f is not None:
             f.write_text(part, encoding="utf-8")
         partials.append(part)
     say("合併成完整筆記…")
     joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
-    return ask(NOTES_MERGE_SYSTEM, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}")
+    return _tidy_markdown(ask(NOTES_MERGE_SYSTEM + glossary_prompt(glossary), f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}"))
