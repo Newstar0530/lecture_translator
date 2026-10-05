@@ -363,9 +363,10 @@ if ss.notes:
         f1, f2, f3 = st.columns([2.4, 1, 1.2], vertical_alignment="center")
         with f1.popover(f"🃏 {len(cards)} flashcards — preview", use_container_width=True):
             st.markdown("\n".join(f"- **{en}** → {zh}" + (f"：{expl}" if expl else "") for en, zh, expl in cards))
-        f2.download_button("Anki", flashcards.to_anki(cards, tag=ss.notes_meta[0]),
+        f2.download_button("Anki", flashcards.to_anki(cards, tag=ss.notes_meta[0],
+                                                     deck=f"Lecture notes::{ss.notes_meta[0] or 'Untitled course'}"),
                            file_name=f"{card_name}_Anki.txt", use_container_width=True,
-                           help="In Anki: File → Import → choose this file")
+                           help="In Anki: File → Import → choose this file. Cards go into the deck \"Lecture notes::<course>\"")
         f3.download_button("Quizlet", flashcards.to_quizlet(cards),
                            file_name=f"{card_name}_Quizlet.txt", use_container_width=True,
                            help="In Quizlet: Create set → Import → paste the whole file")

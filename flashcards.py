@@ -41,9 +41,14 @@ def extract_cards(notes_md: str) -> list[Card]:
     return cards
 
 
-def to_anki(cards: list[Card], tag: str = "") -> str:
-    """Anki：檔案 → 匯入，直接選這個檔案（開頭的 # 設定會自動套用分隔符號和標籤）。"""
+def to_anki(cards: list[Card], tag: str = "", deck: str = "") -> str:
+    """
+    Anki：檔案 → 匯入，直接選這個檔案。
+    開頭的 # 設定會自動套用分隔符號、標籤，並放進指定的牌組（Anki 2.1.55 以後支援）。
+    """
     header = ["#separator:tab", "#html:true"]
+    if deck.strip():
+        header.append(f"#deck:{_clean(deck)}")
     tag = re.sub(r"\s+", "_", tag.strip())
     if tag:
         header.append(f"#tags:{tag}")
