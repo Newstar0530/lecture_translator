@@ -3,3 +3,4 @@ records/
 .venv/
 __pycache__/
 詞彙表/
+.DS_Store
