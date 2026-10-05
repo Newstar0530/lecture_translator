@@ -82,8 +82,11 @@ with st.sidebar:
                               help="1.0 = 跟真實上課一樣快；調快可以快速測試，但費用照音訊長度計算")
         if up is not None:
             tmp = APP_DIR / "records" / "_upload.wav"
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_bytes(up.getvalue())
+            # 只有換了新檔案才寫入，避免每次操作介面都重寫一次
+            if st.session_state.get("uploaded_id") != up.file_id or not tmp.exists():
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_bytes(up.getvalue())
+                st.session_state.uploaded_id = up.file_id
             wav_path = str(tmp)
 
     with st.expander("進階設定"):

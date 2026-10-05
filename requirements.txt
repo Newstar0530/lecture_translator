@@ -1,4 +1,5 @@
-streamlit>=1.40
-mistralai[realtime]>=2.10
-sounddevice>=0.4.6
-numpy>=1.24
+# 固定成測試過的版本，避免套件更新後突然不能用
+streamlit==1.65.0
+mistralai[realtime]==3.0.0
+sounddevice==0.5.6
+numpy==2.5.3

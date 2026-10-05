@@ -40,12 +40,30 @@ DEFAULT_NOTES_MODEL = "mistral-medium-latest"
 # 1. 斷句：把串流進來的零碎文字，組成適合翻譯的句子
 # ---------------------------------------------------------------------------
 _SENTENCE_END = re.compile(r"[.!?…。！？](?:[\"'”’)\]]*)\s")
+# 句點前面是這些縮寫時不算句尾（英文＋法文，比對時不分大小寫）
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "st", "vs", "etc", "e.g", "i.e", "cf", "fig", "no",
+    "vol", "p", "pp", "ch", "approx", "jr", "sr", "inc", "ltd", "co", "u.s", "u.k",
+    "m", "mme", "mlle", "ex", "env",
+}
+
+
+def _is_abbreviation(text: str, dot_pos: int) -> bool:
+    """text[dot_pos] 是句點時，判斷它是不是縮寫（Dr.、e.g.）或人名縮寫（J. Smith）。"""
+    if text[dot_pos] != ".":
+        return False
+    m = re.search(r"([A-Za-zÀ-ÿ.]+)$", text[:dot_pos])
+    if not m:
+        return False
+    word = m.group(1).lstrip(".")
+    return word.lower() in _ABBREVIATIONS or (len(word) == 1 and word.isupper())
 
 
 class SentenceBuffer:
     """
     規則：
     - 遇到句尾標點（. ! ? …）而且後面接了空白，而且累積長度 >= min_chars → 送出
+      （Dr.、e.g.、J. Smith 這類縮寫的句點不算句尾）
     - 累積超過 max_chars 還沒有句尾 → 在最後一個逗號或空白處切開送出
     - 一段時間沒有新文字（idle_seconds）→ 把剩下的送出（由外部呼叫 flush_if_idle）
     min_chars 可以把太短的句子合併，減少翻譯請求次數。
@@ -74,7 +92,7 @@ class SentenceBuffer:
     def _find_cut(self) -> Optional[int]:
         # 找「長度已經夠」之後的第一個句尾
         for m in _SENTENCE_END.finditer(self.buf):
-            if m.end() >= self.min_chars:
+            if m.end() >= self.min_chars and not _is_abbreviation(self.buf, m.start()):
                 return m.end()
         # 太長了：在逗號或空白處切
         if len(self.buf) > self.max_chars:

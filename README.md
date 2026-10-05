@@ -16,7 +16,7 @@
 ```bash
 cd ~/python/lecture_translator
 
-# 1. 確認 Python 版本（需要 3.10 以上）
+# 1. 確認 Python 版本（需要 3.12 以上）
 python3 --version
 
 # 2. 建立虛擬環境並安裝套件
