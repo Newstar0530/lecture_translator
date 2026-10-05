@@ -371,11 +371,13 @@ else:
 can_note = bool(sess and not sess.running and sess.segments)
 note_clicked = b2.button("📝 Generate notes", disabled=not can_note, use_container_width=True)
 show_en = b3.toggle("Show original text", value=True)
-# 只清掉畫面上的字幕；逐字稿檔案、錄音、產生筆記用的內容都不受影響
-# 錄音中只有字幕區會每秒更新、按鈕不會，所以只要有錄音就讓它可以按
-if b4.button("🗑 Clear", disabled=sess is None, use_container_width=True,
-             help="Clear the subtitles on screen. Saved transcripts, the recording and notes are not affected"):
-    ss.clear_from = len(sess.segments)
+# 清掉畫面上的字幕和筆記；存好的逐字稿、錄音、筆記.md 檔案都不受影響，之後也能再產生筆記
+# 錄音中只有字幕區會每秒更新、按鈕不會，所以只要有錄音或筆記就讓它可以按
+if b4.button("🗑 Clear", disabled=sess is None and not ss.notes, use_container_width=True,
+             help="Clear the subtitles and notes on screen. Saved files (transcript, recording, notes) are kept"):
+    if sess:
+        ss.clear_from = len(sess.segments)
+    ss.notes = ss.notes_path = ss.notion_url = None
     st.rerun()
 
 if start_clicked:
