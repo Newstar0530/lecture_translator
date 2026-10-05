@@ -37,16 +37,31 @@ def safe_name(s: str) -> str:
 
 
 st.set_page_config(page_title="即時上課翻譯", page_icon="🎧", layout="wide")
-ss = st.session_state
-ss.setdefault("session", None)
-ss.setdefault("notes", None)
-ss.setdefault("notes_path", None)
+
+
+class SharedState:
+    """整個程式共用一份（不跟著瀏覽器分頁走）：重新整理網頁後，還能接回正在進行的錄音。"""
+    session: LiveSession | None = None
+    notes: str | None = None
+    notes_path: Path | None = None
+
+
+@st.cache_resource
+def get_shared_state() -> SharedState:
+    return SharedState()
+
+
+ss = get_shared_state()
 
 # ---------------------------------------------------------------- 側邊欄
 with st.sidebar:
     st.header("設定")
-    api_key = st.text_input("Mistral API Key", value=load_env_key(), type="password",
-                            help="建議寫在 .env 檔，就不用每次貼上")
+    # .env 的金鑰只留在本機程式裡，不送到瀏覽器
+    env_key = load_env_key()
+    typed_key = st.text_input("Mistral API Key", type="password",
+                              placeholder="已從 .env 讀取，不用填" if env_key else "",
+                              help="建議寫在 .env 檔，就不用每次貼上")
+    api_key = typed_key or env_key
     course = st.text_input("課程名稱", placeholder="例如：Strategies in the arts")
 
     source = st.radio("音訊來源", ["麥克風", "音訊檔（模擬上課）"], horizontal=True)
@@ -125,7 +140,7 @@ if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=Tru
 
 @st.fragment(run_every=1.0)
 def live_view():
-    s: LiveSession | None = st.session_state.session
+    s: LiveSession | None = ss.session
     if s is None:
         st.info("按「▶ 開始」開始錄音。第一次使用前，請先看 README.md。")
         return

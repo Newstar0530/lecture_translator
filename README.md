@@ -78,6 +78,7 @@ streamlit run app.py
 | `筆記.md` | 整理好的筆記（摘要、詳細筆記、作業提醒、專有名詞表、待確認處） | 按「產生筆記」後 |
 
 逐字稿是一邊錄一邊存的，就算程式當掉或網路斷掉，已經辨識的內容也不會不見。
+錄音中不小心重新整理或關掉網頁也沒關係：重新打開 http://localhost:8501 就會接回正在進行的錄音。
 
 ---
 
@@ -124,3 +125,4 @@ streamlit run app.py
 | `requirements.txt` | 需要的套件 |
 | `.env.example` | API Key 設定範本 |
 | `run.command` | 雙擊啟動 |
+| `.streamlit/config.toml` | 只允許本機連線（同一個 Wi-Fi 的人連不進來） |

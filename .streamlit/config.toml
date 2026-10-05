@@ -1,0 +1,3 @@
+# 只讓這台電腦自己連線，同一個 Wi-Fi 的其他人連不進來
+[server]
+address = "localhost"
