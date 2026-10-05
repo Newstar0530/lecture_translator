@@ -17,6 +17,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import flashcards
 import notion_sync
 from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL, SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
@@ -354,6 +355,20 @@ if ss.notes:
         to_notion = False
         head_r.caption("Set up Notion to send notes there (see README)")
     st.caption(f"Saved: {ss.notes_path}")
+
+    # 閃卡：從筆記的專有名詞表做，匯出給 Anki / Quizlet
+    cards = flashcards.extract_cards(ss.notes)
+    if cards:
+        card_name = f"{safe_name(ss.notes_meta[0])}_{ss.notes_meta[1]}"
+        f1, f2, f3 = st.columns([2.4, 1, 1.2], vertical_alignment="center")
+        with f1.popover(f"🃏 {len(cards)} flashcards — preview", use_container_width=True):
+            st.markdown("\n".join(f"- **{en}** → {zh}" + (f"：{expl}" if expl else "") for en, zh, expl in cards))
+        f2.download_button("Anki", flashcards.to_anki(cards, tag=ss.notes_meta[0]),
+                           file_name=f"{card_name}_Anki.txt", use_container_width=True,
+                           help="In Anki: File → Import → choose this file")
+        f3.download_button("Quizlet", flashcards.to_quizlet(cards),
+                           file_name=f"{card_name}_Quizlet.txt", use_container_width=True,
+                           help="In Quizlet: Create set → Import → paste the whole file")
     if to_notion:
         with st.spinner("Sending to Notion…"):
             try:
