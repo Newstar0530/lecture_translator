@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -15,10 +16,11 @@ from pathlib import Path
 import streamlit as st
 
 from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
-                  LiveSession, SessionConfig, fmt_time, generate_notes, list_input_devices)
+                  LiveSession, SessionConfig, TermBook, fmt_time, generate_notes, list_input_devices)
 
 APP_DIR = Path(__file__).parent
 RECORDS_DIR = APP_DIR / "records"
+TERMS_DIR = APP_DIR / "專有名詞"
 
 
 def load_env_key() -> str:
@@ -35,6 +37,21 @@ def load_env_key() -> str:
 
 def safe_name(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", s).strip() or "未命名課程"
+
+
+def load_fixed_terms(course: str) -> dict[str, str]:
+    """讀取這門課修正過的譯名（專有名詞/課程名稱.json）。"""
+    f = TERMS_DIR / f"{safe_name(course)}.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except ValueError:
+        return {}
+
+
+def save_fixed_terms(course: str, terms: dict[str, str]):
+    TERMS_DIR.mkdir(exist_ok=True)
+    (TERMS_DIR / f"{safe_name(course)}.json").write_text(
+        json.dumps(terms, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 st.set_page_config(page_title="即時上課翻譯", page_icon="🎧", layout="wide")
@@ -115,7 +132,7 @@ if c1.button("▶ 開始", type="primary", disabled=running, use_container_width
                             stt_model=stt_model, translate_model=trans_model,
                             target_delay_ms=None if delay_opt == "預設" else int(delay_opt),
                             input_device=device, wav_path=wav_path, wav_speed=wav_speed,
-                            min_chars=min_chars)
+                            min_chars=min_chars, fixed_terms=load_fixed_terms(course))
         ss.session = LiveSession(cfg)
         ss.notes = ss.notes_path = None
         ss.session.start()
@@ -125,13 +142,13 @@ if c2.button("⏹ 停止", disabled=not running, use_container_width=True):
     sess.stop()
     st.rerun()
 
-def make_notes(transcript: str, course: str, date_str: str, out_dir: Path):
+def make_notes(transcript: str, course: str, date_str: str, out_dir: Path, fixed_terms: dict[str, str]):
     """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
     cache_dir = out_dir / ".筆記暫存"
     with st.status("產生筆記中…", expanded=True) as box:
         try:
             notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
-                                   progress=box.write, cache_dir=cache_dir)
+                                   progress=box.write, cache_dir=cache_dir, glossary=fixed_terms)
             path = out_dir / "筆記.md"
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -147,7 +164,7 @@ if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=Tru
         st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
-                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir)
+                   f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir, sess.terms.fixed())
 
 # 程式當掉、關掉後，也能用 records/ 裡存好的逐字稿產生筆記
 saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
@@ -167,7 +184,7 @@ with st.expander("📂 從之前的逐字稿產生筆記"):
                 date_str, _, rest = pick.name.partition("_")
                 course_name = rest.partition("_")[2]
                 make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"),
-                           course_name, date_str, pick)
+                           course_name, date_str, pick, load_fixed_terms(course_name))
 
 
 @st.fragment(run_every=1.0)
@@ -217,3 +234,46 @@ if ss.notes:
     st.caption(f"已存檔：{ss.notes_path}")
     st.download_button("下載筆記（.md）", ss.notes, file_name=Path(ss.notes_path).name)
     st.markdown(ss.notes)
+
+
+# ---------------------------------------------------------------- 側邊欄：專有名詞
+@st.fragment
+def terms_panel():
+    s: LiveSession | None = ss.session
+    # 有錄音（進行中或剛結束）就用那堂課的名詞表；還沒開始就顯示這門課之前修正過的譯名
+    book_course = s.cfg.course if s else course
+    book = s.terms if s else TermBook(load_fixed_terms(course))
+
+    st.subheader("📚 專有名詞")
+    st.caption("翻譯裡附了原文的名詞會自動列在這裡。發現譯名不對，選它、填正確的譯名，"
+               "之後的翻譯和筆記就會照用；下次填同一個課程名稱也會自動套用。")
+    st.button("🔄 更新清單", use_container_width=True)
+    if msg := st.session_state.pop("term_msg", None):
+        st.success(msg)
+
+    rows = list(reversed(book.rows()))            # 最新出現的在最上面
+    if rows:
+        st.dataframe([{"原文": r["en"], "譯名": r["zh"], "": "✅" if r["fixed"] else ""} for r in rows],
+                     hide_index=True, use_container_width=True, height=min(36 * len(rows) + 38, 280))
+    else:
+        st.caption("開始錄音後，名詞會陸續出現。")
+
+    other = "（清單裡沒有，手動輸入）"
+    with st.form("fix_term", clear_on_submit=True, border=False):
+        pick = st.selectbox("要修正的名詞", [r["en"] for r in rows] + [other])
+        manual_en = st.text_input("原文", placeholder="選「手動輸入」時才要填")
+        zh = st.text_input("正確的譯名", placeholder="例如：有益財")
+        if st.form_submit_button("套用", type="primary", use_container_width=True):
+            en = manual_en.strip() or ("" if pick == other else pick)
+            if not en or not zh.strip():
+                st.warning("請填好原文和正確的譯名")
+            else:
+                book.fix(en, zh)
+                save_fixed_terms(book_course, book.fixed())
+                st.session_state.term_msg = f"已套用：{en} → {zh.strip()}"
+                st.rerun(scope="fragment")
+
+
+with st.sidebar:
+    st.divider()
+    terms_panel()

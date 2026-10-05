@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import queue as thread_queue
 import re
 import threading
@@ -181,19 +182,79 @@ def list_input_devices() -> list[tuple[int, str]]:
 TRANSLATE_SYSTEM = (
     "你是大學課堂的即時口譯員。把使用者給的課堂逐字稿片段（英文或法文）翻譯成自然、準確的繁體中文（台灣用語）。\n"
     "規則：\n"
-    "1. 只輸出翻譯，不要加解釋、不要加引號、不要重複原文。\n"
-    "2. 片段裡的每一句都要翻譯，包括開場、轉折的短句（例如 Let's start with a simple question.、Now, compare two models.），"
-    "不可以省略、摘要或合併句子。\n"
-    "3. 專有名詞、人名、理論名稱第一次出現時保留原文在括號內，例如：轉換型領導（transformational leadership）。"
+    "1. 片段裡的每一句都要翻譯，包括開場、轉折的短句（例如 Let's start with a simple question.、Now, compare two models.），"
+    "不可以省略、摘要或合併句子。不要加解釋、不要重複原文。\n"
+    "2. 專有名詞、人名、理論名稱、機構名稱在翻譯中保留原文在括號內，例如：轉換型領導（transformational leadership）。"
     "只使用學術界通用的中文譯名；不確定有沒有通用譯名時，直接保留原文，不要自己創造譯名，也不要用成語或字面意思硬翻。\n"
-    "4. 逐字稿是語音辨識結果，可能有錯字或斷句不完整；照字面合理翻譯，不要自行補充原文沒有的內容。\n"
-    "5. 「前文」只是幫助你理解上下文：不要翻譯前文，也不要把前文的內容加進翻譯裡。"
+    "3. 逐字稿是語音辨識結果，可能有錯字或斷句不完整；照字面合理翻譯，不要自行補充原文沒有的內容。\n"
+    "4. 「前文」只是幫助你理解上下文：不要翻譯前文，也不要把前文的內容加進翻譯裡。\n"
+    "5. 用 JSON 回覆，格式：{\"translation\": \"翻譯\", \"terms\": [{\"en\": \"原文\", \"zh\": \"你用的中文譯名\"}]}。"
+    "terms 列出這個片段（不含前文）裡你附了原文的每一個名詞；zh 必須和 translation 裡用的譯名一致，保留原文沒翻的就填原文。沒有就給空陣列。"
 )
 
 
-def build_translate_messages(context: str, text: str) -> list[dict]:
+def glossary_prompt(glossary: dict[str, str]) -> str:
+    """把指定譯名加到系統提示後面。"""
+    if not glossary:
+        return ""
+    lines = "\n".join(f"{en} = {zh}" for en, zh in glossary.items())
+    return "\n\n指定譯名（遇到這些名詞一定要使用這裡的中文譯名）：\n" + lines
+
+
+def build_translate_messages(context: str, text: str, glossary: Optional[dict[str, str]] = None) -> list[dict]:
     user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{text}"
-    return [{"role": "system", "content": TRANSLATE_SYSTEM}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": TRANSLATE_SYSTEM + glossary_prompt(glossary or {})},
+            {"role": "user", "content": user}]
+
+
+def parse_translation(raw: str) -> tuple[str, list[tuple[str, str]]]:
+    """解析翻譯模型的 JSON 回覆；模型沒照格式回時，整段當翻譯、沒有名詞。"""
+    try:
+        data = json.loads(raw)
+        text = str(data["translation"]).strip()
+        terms = [(str(t["en"]).strip(), str(t["zh"]).strip()) for t in data.get("terms") or []
+                 if isinstance(t, dict) and t.get("en") and t.get("zh")]
+        return text, terms
+    except (ValueError, KeyError, TypeError):
+        return raw.strip(), []
+
+
+class TermBook:
+    """
+    專有名詞表：翻譯時自動收集「原文 → 譯名」。
+    使用者修正過的譯名（fixed）會強制套用到之後的翻譯和筆記；
+    沒修正過的也會在之後的翻譯沿用，讓同一個名詞前後譯名一致。
+    """
+
+    def __init__(self, fixed: Optional[dict[str, str]] = None):
+        self.lock = threading.Lock()
+        self._terms: dict[str, dict] = {}       # key = 原文小寫
+        for en, zh in (fixed or {}).items():
+            self.fix(en, zh)
+
+    def add_seen(self, en: str, zh: str):
+        with self.lock:
+            self._terms.setdefault(en.lower(), {"en": en, "zh": zh, "fixed": False})
+
+    def fix(self, en: str, zh: str):
+        en, zh = en.strip(), zh.strip()
+        if en and zh:
+            with self.lock:
+                self._terms[en.lower()] = {"en": en, "zh": zh, "fixed": True}
+
+    def fixed(self) -> dict[str, str]:
+        with self.lock:
+            return {t["en"]: t["zh"] for t in self._terms.values() if t["fixed"]}
+
+    def rows(self) -> list[dict]:
+        with self.lock:
+            return [dict(t) for t in self._terms.values()]
+
+    def relevant(self, text: str) -> dict[str, str]:
+        """只挑原文有出現在 text 裡的名詞，避免提示越來越長。"""
+        low = text.lower()
+        with self.lock:
+            return {t["en"]: t["zh"] for k, t in self._terms.items() if k in low}
 
 
 @dataclass
@@ -208,6 +269,7 @@ class SessionConfig:
     wav_path: Optional[str] = None           # 有值 = 用音訊檔模擬
     wav_speed: float = 1.0                   # 模擬播放速度
     min_chars: int = 80
+    fixed_terms: dict = field(default_factory=dict)   # 使用者修正過的譯名 {原文: 中文}
     max_reconnects: int = 5
 
 
@@ -233,6 +295,7 @@ class LiveSession:
         self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
         self.source_path = cfg.out_dir / "逐字稿_原文.txt"
         self._written_upto = 0
+        self.terms = TermBook(cfg.fixed_terms)
 
     # ----- 對外介面 -----
     def start(self):
@@ -436,11 +499,15 @@ class LiveSession:
                 context = " ".join(s.source for s in self.segments[max(0, seg.idx - 2):seg.idx])
             for attempt in range(3):
                 try:
+                    glossary = self.terms.relevant(f"{context} {seg.source}")
                     resp = await self._client_chat(client, self.cfg.translate_model,
-                                                   build_translate_messages(context, seg.source),
-                                                   temperature=0.2)
+                                                   build_translate_messages(context, seg.source, glossary),
+                                                   temperature=0.2, response_format={"type": "json_object"})
+                    text, terms = parse_translation(_message_text(resp))
+                    for en, zh in terms:
+                        self.terms.add_seen(en, zh)
                     with self.lock:
-                        seg.translation = _message_text(resp)
+                        seg.translation = text
                     break
                 except Exception as e:
                     wait = 5 * (attempt + 1) if "429" in str(e) else 1.5 * (attempt + 1)
@@ -519,10 +586,12 @@ def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
 def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                    model: str = DEFAULT_NOTES_MODEL, client=None,
                    progress: Optional[Callable[[str], None]] = None,
-                   cache_dir: Optional[Path] = None, retries: int = 4) -> str:
+                   cache_dir: Optional[Path] = None, retries: int = 4,
+                   glossary: Optional[dict[str, str]] = None) -> str:
     """
     分段整理逐字稿，再合併成一份筆記。
     cache_dir：每段整理好就先存檔；中途失敗後再按一次，已完成的段落直接沿用，不會重複扣費。
+    glossary：使用者修正過的譯名，筆記裡一定照用。
     """
     if client is None:
         from mistralai.client import Mistral
@@ -547,10 +616,13 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                 say(f"⚠️ 請求失敗，{wait} 秒後重試（第 {attempt + 1} 次）：{e}")
                 time.sleep(wait)
 
+    chunk_system = NOTES_CHUNK_SYSTEM + glossary_prompt(glossary or {})
+    merge_system = NOTES_MERGE_SYSTEM + glossary_prompt(glossary or {})
+
     def cache_file(chunk: str) -> Optional[Path]:
         if cache_dir is None:
             return None
-        key = hashlib.sha256(f"{model}\n{NOTES_CHUNK_SYSTEM}\n{chunk}".encode("utf-8")).hexdigest()[:16]
+        key = hashlib.sha256(f"{model}\n{chunk_system}\n{chunk}".encode("utf-8")).hexdigest()[:16]
         return cache_dir / f"{key}.md"
 
     if cache_dir is not None:
@@ -563,10 +635,10 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
             partials.append(f.read_text(encoding="utf-8"))
             continue
         say(f"整理第 {i}/{len(chunks)} 段…")
-        part = ask(NOTES_CHUNK_SYSTEM, c)
+        part = ask(chunk_system, c)
         if f is not None:
             f.write_text(part, encoding="utf-8")
         partials.append(part)
     say("合併成完整筆記…")
     joined = "\n\n---\n\n".join(f"【第 {i} 段】\n{p}" for i, p in enumerate(partials, 1))
-    return _tidy_markdown(ask(NOTES_MERGE_SYSTEM, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}"))
+    return _tidy_markdown(ask(merge_system, f"課程名稱：{course or '（未填）'}\n日期：{date_str}\n\n{joined}"))
