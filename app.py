@@ -247,6 +247,25 @@ st.html("""<style>
 .seg:nth-child(n+5) { opacity: .8; } .seg:nth-child(n+8) { opacity: .6; } .seg:nth-child(n+12) { opacity: .45; }
 .seg:hover { opacity: 1; background: rgba(110,168,254,.06); }
 
+/* ---------- 側邊欄三組區塊 ---------- */
+/* 每組一張玻璃卡片，各自一個顏色的漸層外框：這堂課＝藍、收音＝紫、修正譯名＝青 */
+.st-key-grp_class, .st-key-grp_audio, .st-key-grp_terms {
+  --c: #6ea8fe; padding: .9rem .95rem .75rem; border-radius: 16px; border: 1px solid transparent;
+  background: linear-gradient(180deg, rgba(24,29,40,.92), rgba(18,22,31,.92)) padding-box,
+              linear-gradient(150deg, var(--c), rgba(255,255,255,.04) 55%, rgba(255,255,255,.08)) border-box;
+  box-shadow: 0 8px 26px -14px var(--c); position: relative;
+  transition: transform .2s ease, box-shadow .2s ease; animation: riseIn .5s ease-out both; }
+.st-key-grp_audio { --c: #a78bfa; animation-delay: .08s; }
+.st-key-grp_terms { --c: #2dd4bf; animation-delay: .16s; }
+.st-key-grp_class:hover, .st-key-grp_audio:hover, .st-key-grp_terms:hover {
+  transform: translateY(-2px); box-shadow: 0 14px 34px -14px var(--c); }
+/* 卡片左上角一條發光短線，和標題用同一個顏色 */
+.st-key-grp_class::before, .st-key-grp_audio::before, .st-key-grp_terms::before {
+  content:""; position:absolute; top:-1px; left:18px; width:42px; height:3px; border-radius:3px;
+  background: var(--c); box-shadow: 0 0 12px var(--c); }
+.st-key-grp_audio h4, .st-key-grp_terms h4 { color: var(--c); padding-top: .1rem; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .9rem; }
+
 /* 系統設定「減少動態效果」時全部關掉 */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -278,71 +297,76 @@ with st.sidebar:
     if not api_key:
         st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
 
-    course = st.text_input("Course name")
+    # 第一組：這堂課（課程名稱＋簡報）
+    with st.container(key="grp_class"):
+        course = st.text_input("Course name")
 
-    # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
-    slides_file = st.file_uploader("Lecture slides (recommended)", type=["pdf", "pptx"],
-                                   help="Upload the PDF or PPTX before class. Translations will use the field's terminology and the standard translations of terms in the slides")
-    slides = None
-    if slides_file is not None:
-        data = slides_file.getvalue()
-        digest = hashlib.sha256(data).hexdigest()
-        cached = st.session_state.get("slides")
-        if cached and cached["digest"] == digest:
-            slides = cached
-        elif api_key:
+        # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
+        slides_file = st.file_uploader("Lecture slides", type=["pdf", "pptx"],
+                                       help="Upload the PDF or PPTX before class. Translations will use the field's terminology and the standard translations of terms in the slides")
+        slides = None
+        if slides_file is not None:
+            data = slides_file.getvalue()
+            digest = hashlib.sha256(data).hexdigest()
+            cached = st.session_state.get("slides")
+            if cached and cached["digest"] == digest:
+                slides = cached
+            elif api_key:
+                try:
+                    slide_text = extract_slide_text(slides_file.name, data)
+                    n_parts = len(split_slide_text(slide_text))
+                    label = ("Reading slides… (about 10 seconds)" if n_parts == 1 else
+                             f"Reading long slides in {min(n_parts, SLIDES_MAX_PARTS)} parts… (about 10–20 seconds)")
+                    with st.spinner(label):
+                        brief, terms, warning = analyze_slides(api_key, slide_text)
+                        slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms,
+                                  "warning": warning, "pages": len(re.findall(r"\[第 \d+ 頁\]", slide_text)),
+                                  "parts": n_parts}
+                        st.session_state.slides = slides
+                except Exception as e:
+                    st.warning(f"Couldn't read these slides: {e}")
+            if slides:
+                with st.container(border=True):
+                    if slides.get("warning"):
+                        st.warning(slides["warning"], icon="⚠️")
+                    elif slides.get("parts", 1) > 1:
+                        st.caption(f"Read all {slides['pages']} slides in {slides['parts']} parts")
+                    st.caption(f"📖 {slides['summary']}")
+                    with st.popover(f"{len(slides['terms'])} terms from the slides", use_container_width=True):
+                        st.markdown("\n".join(f"- {en} → **{zh}**" for en, zh in slides["terms"].items()) or "(none)")
+
+    # 第二組：收音
+    with st.container(key="grp_audio"):
+        st.markdown("#### Audio")
+        source = st.segmented_control("Audio source", ["Microphone", "Audio file"], default="Microphone",
+                                      label_visibility="collapsed") or "Microphone"
+        device, wav_path, wav_speed = None, None, 1.0
+        if source == "Microphone":
             try:
-                slide_text = extract_slide_text(slides_file.name, data)
-                n_parts = len(split_slide_text(slide_text))
-                label = ("Reading slides… (about 10 seconds)" if n_parts == 1 else
-                         f"Reading long slides in {min(n_parts, SLIDES_MAX_PARTS)} parts… (about 10–20 seconds)")
-                with st.spinner(label):
-                    brief, terms, warning = analyze_slides(api_key, slide_text)
-                    slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms,
-                              "warning": warning, "pages": len(re.findall(r"\[第 \d+ 頁\]", slide_text)),
-                              "parts": n_parts}
-                    st.session_state.slides = slides
+                devices = list_input_devices()
+                names = ["System default microphone"] + [f"{i}: {n}" for i, n in devices]
+                pick = st.selectbox("Microphone", names, label_visibility="collapsed")
+                if pick != names[0]:
+                    device = int(pick.split(":")[0])
             except Exception as e:
-                st.warning(f"Couldn't read these slides: {e}")
-        if slides:
-            with st.container(border=True):
-                if slides.get("warning"):
-                    st.warning(slides["warning"], icon="⚠️")
-                elif slides.get("parts", 1) > 1:
-                    st.caption(f"Read all {slides['pages']} slides in {slides['parts']} parts")
-                st.caption(f"📖 {slides['summary']}")
-                with st.popover(f"{len(slides['terms'])} terms from the slides", use_container_width=True):
-                    st.markdown("\n".join(f"- {en} → **{zh}**" for en, zh in slides["terms"].items()) or "(none)")
+                st.warning(f"Couldn't list microphones: {e}")
+        else:
+            up = st.file_uploader("WAV file (16-bit), to simulate a class", type=["wav"])
+            wav_speed = st.slider("Playback speed", 1.0, 4.0, 1.0, 0.5,
+                                  help="1.0 = real-time. Faster is handy for testing, but cost is still based on the audio length")
+            if up is not None:
+                tmp = APP_DIR / "records" / "_upload.wav"
+                # 只有換了新檔案才寫入，避免每次操作介面都重寫一次
+                if st.session_state.get("uploaded_id") != up.file_id or not tmp.exists():
+                    tmp.parent.mkdir(parents=True, exist_ok=True)
+                    tmp.write_bytes(up.getvalue())
+                    st.session_state.uploaded_id = up.file_id
+                wav_path = str(tmp)
+        save_audio = st.toggle("Also save the recording (FLAC)", value=True,
+                               help="Saved in this class's folder so you can listen again later. About 60–90 MB per hour; doesn't affect recognition or cost")
 
-    st.markdown("#### Audio")
-    source = st.segmented_control("Audio source", ["Microphone", "Audio file"], default="Microphone",
-                                  label_visibility="collapsed") or "Microphone"
-    device, wav_path, wav_speed = None, None, 1.0
-    if source == "Microphone":
-        try:
-            devices = list_input_devices()
-            names = ["System default microphone"] + [f"{i}: {n}" for i, n in devices]
-            pick = st.selectbox("Microphone", names, label_visibility="collapsed")
-            if pick != names[0]:
-                device = int(pick.split(":")[0])
-        except Exception as e:
-            st.warning(f"Couldn't list microphones: {e}")
-    else:
-        up = st.file_uploader("WAV file (16-bit), to simulate a class", type=["wav"])
-        wav_speed = st.slider("Playback speed", 1.0, 4.0, 1.0, 0.5,
-                              help="1.0 = real-time. Faster is handy for testing, but cost is still based on the audio length")
-        if up is not None:
-            tmp = APP_DIR / "records" / "_upload.wav"
-            # 只有換了新檔案才寫入，避免每次操作介面都重寫一次
-            if st.session_state.get("uploaded_id") != up.file_id or not tmp.exists():
-                tmp.parent.mkdir(parents=True, exist_ok=True)
-                tmp.write_bytes(up.getvalue())
-                st.session_state.uploaded_id = up.file_id
-            wav_path = str(tmp)
-    save_audio = st.toggle("Also save the recording (FLAC)", value=True,
-                           help="Saved in this class's folder so you can listen again later. About 60–90 MB per hour; doesn't affect recognition or cost")
-
-    terms_slot = st.container()   # 修正譯名（函式在檔案最後定義）
+    # 第三組：修正譯名（函式在檔案最後定義）
+    terms_slot = st.container(key="grp_terms")
 
     with st.expander("Advanced settings"):
         stt_model = st.text_input("Speech recognition model", DEFAULT_STT_MODEL)
