@@ -18,9 +18,9 @@ from pathlib import Path
 import streamlit as st
 
 import notion_sync
-from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
+from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL, SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
-                  fmt_time, generate_notes, list_input_devices, merge_terms)
+                  fmt_time, generate_notes, list_input_devices, merge_terms, split_slide_text)
 
 APP_DIR = Path(__file__).parent
 RECORDS_DIR = APP_DIR / "records"
@@ -150,18 +150,25 @@ with st.sidebar:
         if cached and cached["digest"] == digest:
             slides = cached
         elif api_key:
-            with st.spinner("Reading slides… (about 10 seconds)"):
-                try:
-                    brief, terms, warning = analyze_slides(api_key, extract_slide_text(slides_file.name, data))
+            try:
+                slide_text = extract_slide_text(slides_file.name, data)
+                n_parts = len(split_slide_text(slide_text))
+                label = ("Reading slides… (about 10 seconds)" if n_parts == 1 else
+                         f"Reading long slides in {min(n_parts, SLIDES_MAX_PARTS)} parts… (about 10–20 seconds)")
+                with st.spinner(label):
+                    brief, terms, warning = analyze_slides(api_key, slide_text)
                     slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms,
-                              "warning": warning}
+                              "warning": warning, "pages": len(re.findall(r"\[第 \d+ 頁\]", slide_text)),
+                              "parts": n_parts}
                     st.session_state.slides = slides
-                except Exception as e:
-                    st.warning(f"Couldn't read these slides: {e}")
+            except Exception as e:
+                st.warning(f"Couldn't read these slides: {e}")
         if slides:
             with st.container(border=True):
                 if slides.get("warning"):
                     st.warning(slides["warning"], icon="⚠️")
+                elif slides.get("parts", 1) > 1:
+                    st.caption(f"Read all {slides['pages']} slides in {slides['parts']} parts")
                 st.caption(f"📖 {slides['summary']}")
                 with st.popover(f"{len(slides['terms'])} terms from the slides", use_container_width=True):
                     st.markdown("\n".join(f"- {en} → **{zh}**" for en, zh in slides["terms"].items()) or "(none)")

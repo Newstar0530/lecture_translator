@@ -804,7 +804,8 @@ SLIDES_SYSTEM = (
     "summary：用繁體中文（台灣用語）2–3 句說明這堂課的學科領域、主題和重點概念。\n"
     "terms：列出簡報裡的專有名詞、理論、概念、人名、機構名，最多 80 個。規則：\n"
     "- 只列完整的專業名詞（例如 merit goods、arm's length principle），不要列 board、goods 這種一般單字\n"
-    "- zh 用台灣學術界通用的譯名；人名、機構名沒有通用譯名就保留原文；不確定的也保留原文，不要自己創造譯名"
+    "- zh 用台灣學術界通用的譯名；人名、機構名沒有通用譯名就保留原文；不確定的也保留原文，不要自己創造譯名\n"
+    "- zh 只填一個譯名，不要加括號說明或「或稱…」"
 )
 SLIDES_MAX_CHARS = 40000
 
@@ -830,37 +831,89 @@ def extract_slide_text(filename: str, data: bytes) -> str:
 
 
 _PAGE_MARK = re.compile(r"\[第 \d+ 頁\]")
+SLIDES_MAX_PARTS = 8          # 最多分 8 批（每批約 80–100 頁），避免超大的檔案花太多錢
+SLIDES_MERGE_SYSTEM = (
+    "以下是同一份簡報分批整理出的摘要。合併成一段繁體中文（台灣用語）2–3 句，"
+    "說明這堂課的學科領域、主題和重點概念。只輸出摘要。"
+)
 
 
-def limit_slide_text(text: str, max_chars: int = SLIDES_MAX_CHARS) -> tuple[str, str]:
-    """
-    簡報文字太長時，只留前面完整的幾頁（不切到半頁）。
-    回傳（要送出的文字, 提醒訊息）；沒有超過就回傳原文和空字串。
-    """
-    if len(text) <= max_chars:
-        return text, ""
-    total = len(_PAGE_MARK.findall(text))
-    cut = text[:max_chars]
-    last_page = cut.rfind("\n\n[第 ")
-    if last_page > 0:
-        cut = cut[:last_page]
-    read = len(_PAGE_MARK.findall(cut))
-    return cut, f"Slides too long: only the first {read} of {total} slides were read. Terms on later slides won't be picked up automatically."
+def split_slide_text(text: str, max_chars: int = SLIDES_MAX_CHARS) -> list[str]:
+    """把簡報文字切成每批不超過 max_chars 的幾批，盡量在頁與頁之間切（單頁太長才從中間切）。"""
+    parts: list[str] = []
+    cur = ""
+    for page in re.split(r"\n\n(?=\[第 \d+ 頁\])", text):
+        while len(page) > max_chars:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(page[:max_chars])
+            page = page[max_chars:]
+        if cur and len(cur) + 2 + len(page) > max_chars:
+            parts.append(cur)
+            cur = page
+        else:
+            cur = f"{cur}\n\n{page}" if cur else page
+    if cur.strip():
+        parts.append(cur)
+    return parts
 
 
 def analyze_slides(api_key: str, text: str, model: str = DEFAULT_SLIDES_MODEL,
                    client=None) -> tuple[str, dict[str, str], str]:
-    """讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}, 提醒訊息）。"""
+    """
+    讀簡報文字，回傳（課程背景摘要, {原文: 中文譯名}, 提醒訊息）。
+    簡報太長就分批同時讀，再把名詞表合併、摘要整合成一段；超過 SLIDES_MAX_PARTS 批才會略過後面的頁面。
+    """
     if not text.strip():
         raise ValueError("No text found in the slides (they may be scanned images)")
-    text, warning = limit_slide_text(text)
+    parts = split_slide_text(text)
+    warning = ""
+    if len(parts) > SLIDES_MAX_PARTS:
+        total = len(_PAGE_MARK.findall(text))
+        parts = parts[:SLIDES_MAX_PARTS]
+        read = sum(len(_PAGE_MARK.findall(p)) for p in parts)
+        warning = (f"Slides very long: only the first {read} of {total} slides were read. "
+                   "Terms on later slides won't be picked up automatically.")
     if client is None:
         from mistralai.client import Mistral
         client = Mistral(api_key=api_key)
-    resp = client.chat.complete(model=model, temperature=0.1, response_format={"type": "json_object"},
-                                messages=[{"role": "system", "content": SLIDES_SYSTEM},
-                                          {"role": "user", "content": text}])
-    data = json.loads(_message_text(resp))
-    terms = {str(t["en"]).strip(): str(t["zh"]).strip() for t in data.get("terms") or []
-             if isinstance(t, dict) and t.get("en") and t.get("zh")}
-    return str(data.get("summary", "")).strip(), terms, warning
+
+    def ask(messages, json_mode: bool) -> str:
+        for attempt in range(3):
+            try:
+                kw = {"response_format": {"type": "json_object"}} if json_mode else {}
+                resp = client.chat.complete(model=model, temperature=0.1, messages=messages, **kw)
+                return _message_text(resp)
+            except Exception as e:
+                if attempt == 2 or "401" in str(e) or "403" in str(e):
+                    raise
+                time.sleep(10 * (attempt + 1) if "429" in str(e) else 3 * (attempt + 1))
+
+    def read_part(part: str) -> dict:
+        return json.loads(ask([{"role": "system", "content": SLIDES_SYSTEM},
+                               {"role": "user", "content": part}], json_mode=True))
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(read_part, parts))
+
+    # 合併各批的名詞：原文不分大小寫，先出現的譯名為準
+    terms: dict[str, str] = {}
+    seen: set[str] = set()
+    for data in results:
+        for t in data.get("terms") or []:
+            if isinstance(t, dict) and t.get("en") and t.get("zh"):
+                en = str(t["en"]).strip()
+                # 模型偶爾會寫成「A（或稱「B」）」，只留第一個譯名
+                zh = re.sub(r"\s*[（(]\s*(或稱|又稱|或|亦稱).*$", "", str(t["zh"])).strip() or en
+                if en.lower() not in seen:
+                    seen.add(en.lower())
+                    terms[en] = zh
+    summaries = [str(d.get("summary", "")).strip() for d in results if d.get("summary")]
+    if len(summaries) <= 1:
+        summary = summaries[0] if summaries else ""
+    else:
+        summary = ask([{"role": "system", "content": SLIDES_MERGE_SYSTEM},
+                       {"role": "user", "content": "\n\n".join(summaries)}], json_mode=False).strip()
+    return summary, terms, warning
