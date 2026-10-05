@@ -121,6 +121,7 @@ class SharedState:
     notes_path: Path | None = None
     notes_meta: tuple[str, str] = ("", "")    # 筆記的（課程名稱, 日期），傳到 Notion 用
     notion_url: str | None = None
+    clear_from: int = 0                       # 「Clear」之後，畫面只顯示這一段之後的字幕
 
 
 @st.cache_resource
@@ -221,7 +222,7 @@ running = bool(sess and sess.running)
 shown_course = (sess.cfg.course if sess else course) or "Untitled course"
 st.html(f'<div class="app-head"><div class="app-title">🎧 Nova&#39;s translator</div>'
         f'<div class="app-sub">{html.escape(shown_course)}</div></div>')
-b1, b2, b3 = st.columns([1, 1, 1.2], vertical_alignment="center")
+b1, b2, b4, b3 = st.columns([1, 1, 0.75, 1.2], vertical_alignment="center")
 start_clicked = stop_clicked = False
 if running:
     stop_clicked = b1.button("⏹ Stop", use_container_width=True)
@@ -230,6 +231,12 @@ else:
 can_note = bool(sess and not sess.running and sess.segments)
 note_clicked = b2.button("📝 Generate notes", disabled=not can_note, use_container_width=True)
 show_en = b3.toggle("Show original text", value=True)
+# 只清掉畫面上的字幕；逐字稿檔案、錄音、產生筆記用的內容都不受影響
+# 錄音中只有字幕區會每秒更新、按鈕不會，所以只要有錄音就讓它可以按
+if b4.button("🗑 Clear", disabled=sess is None, use_container_width=True,
+             help="Clear the subtitles on screen. Saved transcripts, the recording and notes are not affected"):
+    ss.clear_from = len(sess.segments)
+    st.rerun()
 
 if start_clicked:
     if not api_key:
@@ -251,6 +258,7 @@ if start_clicked:
                 {"name": slides["name"], "summary": slides["summary"], "terms": slides["terms"]},
                 ensure_ascii=False, indent=2), encoding="utf-8")
         ss.notes = ss.notes_path = ss.notion_url = None
+        ss.clear_from = 0
         ss.session.start()
         st.rerun()
 
@@ -328,12 +336,14 @@ def live_view():
 
     if partial and s.running:
         st.html(f'<div class="listening"><b>Listening</b>{html.escape(partial)}</div>')
-    rows = segs[-max_rows:]
+    rows = segs[ss.clear_from:][-max_rows:]
     if newest_first:
         rows = rows[::-1]
     if rows:
         latest = rows[0] if newest_first else rows[-1]
         st.html("".join(seg_html(seg, show_en, seg is latest) for seg in rows))
+    elif s.running and ss.clear_from:
+        st.caption("Screen cleared — new subtitles will appear here")
     elif s.running:
         st.caption("Waiting for the lecturer — the first subtitle appears a few seconds after they start…")
     if not s.running and segs:
