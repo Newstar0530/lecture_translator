@@ -254,11 +254,25 @@ st.html("""<style>
   background: linear-gradient(180deg, rgba(24,29,40,.92), rgba(18,22,31,.92)) padding-box,
               linear-gradient(150deg, var(--c), rgba(255,255,255,.04) 55%, rgba(255,255,255,.08)) border-box;
   box-shadow: 0 8px 26px -14px var(--c); position: relative;
-  transition: transform .2s ease, box-shadow .2s ease; animation: riseIn .5s ease-out both; }
-.st-key-grp_audio { --c: #a78bfa; animation-delay: .08s; }
-.st-key-grp_terms { --c: #2dd4bf; animation-delay: .16s; }
+  /* 進場動畫和繞圈的角度同時設好，滑鼠移進移出都不改 animation，進場動畫才不會重播 */
+  transition: box-shadow .2s ease; animation: riseIn .5s ease-out both, spin 2.4s linear infinite; }
+.st-key-grp_audio { --c: #a78bfa; animation-delay: .08s, 0s; }
+.st-key-grp_terms { --c: #2dd4bf; animation-delay: .16s, 0s; }
+/* 滑鼠移上去：一道光沿著外框繞圈，外面跟著一圈柔和的光暈 */
 .st-key-grp_class:hover, .st-key-grp_audio:hover, .st-key-grp_terms:hover {
-  transform: translateY(-2px); box-shadow: 0 14px 34px -14px var(--c); }
+  background: linear-gradient(180deg, rgba(24,29,40,.95), rgba(18,22,31,.95)) padding-box,
+              conic-gradient(from var(--a), transparent 0deg, var(--c) 50deg, #ffffff 70deg, var(--c) 90deg,
+                             transparent 140deg, transparent 360deg) border-box;
+  box-shadow: 0 14px 34px -16px var(--c); }
+.st-key-grp_class::after, .st-key-grp_audio::after, .st-key-grp_terms::after {
+  content:""; position:absolute; inset:-12px; padding:12px; border-radius:28px; z-index:-1; pointer-events:none;
+  background: conic-gradient(from var(--a), transparent 0deg, var(--c) 60deg, transparent 140deg, transparent 360deg);
+  filter: blur(8px); opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite;
+  /* 只留卡片外面那一圈，光暈才不會蓋到卡片裡面的內容 */
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude; }
+.st-key-grp_class:hover::after, .st-key-grp_audio:hover::after, .st-key-grp_terms:hover::after {
+  opacity: .9; }
 /* 卡片左上角一條發光短線，和標題用同一個顏色 */
 .st-key-grp_class::before, .st-key-grp_audio::before, .st-key-grp_terms::before {
   content:""; position:absolute; top:-1px; left:18px; width:42px; height:3px; border-radius:3px;
