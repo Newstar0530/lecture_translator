@@ -111,6 +111,56 @@ st.html("""<style>
 .st-key-notes h2 { font-size:1.15rem; padding-top:1rem; border-top:1px solid var(--line); margin-top:.6rem; }
 .st-key-notes h3 { font-size:1.02rem; }
 .st-key-notes hr { display:none; }
+
+/* ---------- 動畫 ---------- */
+@keyframes riseIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+@keyframes glow { from { box-shadow:0 0 0 1px rgba(110,168,254,.7), 0 0 28px rgba(110,168,254,.45); }
+                  to   { box-shadow:0 0 0 0 rgba(110,168,254,0), 0 0 0 rgba(110,168,254,0); } }
+@keyframes shimmer { from { background-position:200% 0; } to { background-position:-200% 0; } }
+@keyframes eq { 0%,100% { transform:scaleY(.35); } 50% { transform:scaleY(1); } }
+@keyframes breathe { 0%,100% { box-shadow:0 0 0 0 rgba(255,92,92,0); } 50% { box-shadow:0 0 0 4px rgba(255,92,92,.18); } }
+
+/* 頁面載入：標題、空白狀態的步驟依序淡入 */
+.app-head { animation: riseIn .6s ease-out both; }
+.empty { animation: fadeIn .6s ease-out both; }
+.empty li { animation: riseIn .5s ease-out both; }
+.empty li:nth-child(1) { animation-delay:.15s; } .empty li:nth-child(2) { animation-delay:.3s; }
+.empty li:nth-child(3) { animation-delay:.45s; }
+
+/* 新字幕：文字浮上來、卡片外框亮一下（只在第一次出現時加 fresh） */
+.latest.fresh { animation: glow 1.6s ease-out; }
+.latest.fresh .zh, .latest.fresh .en { animation: riseIn .45s ease-out both; }
+.latest.fresh .en { animation-delay:.08s; }
+
+/* 翻譯中：文字掃光 */
+.pending { font-style: normal; background: linear-gradient(90deg, var(--muted) 30%, #e6e8ee 50%, var(--muted) 70%);
+  background-size:200% 100%; -webkit-background-clip:text; background-clip:text; color:transparent;
+  animation: shimmer 1.5s linear infinite; }
+
+/* 正在聽：等化器跳動（週期 1 秒，跟畫面每秒更新同步，看起來不會跳針） */
+.eq { display:inline-flex; gap:2px; align-items:flex-end; height:.8rem; margin-right:.45rem; vertical-align:-1px; }
+.eq i { width:3px; height:100%; background:var(--accent); border-radius:2px; transform-origin:bottom; animation: eq 1s ease-in-out infinite; }
+.eq i:nth-child(2) { animation-delay:-.25s; } .eq i:nth-child(3) { animation-delay:-.5s; } .eq i:nth-child(4) { animation-delay:-.75s; }
+
+/* 錄音中的紅點改成 1 秒週期，跟畫面更新同步 */
+.pill.rec .dot { animation: pulse 1s infinite; }
+
+/* 按鈕：滑過微微浮起；錄音中的停止鈕慢慢呼吸 */
+.stButton button, .stDownloadButton button, .stFormSubmitButton button, [data-testid="stPopover"] button {
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
+.stButton button:hover:not(:disabled), .stDownloadButton button:hover:not(:disabled),
+.stFormSubmitButton button:hover:not(:disabled), [data-testid="stPopover"] button:hover {
+  transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,0,0,.35); }
+.st-key-stop_btn button { border-color: rgba(255,92,92,.55); color:#ffb3b3; animation: breathe 2s ease-in-out infinite; }
+
+/* 筆記卡片淡入 */
+.st-key-notes { animation: riseIn .5s ease-out both; }
+
+/* 系統設定「減少動態效果」時全部關掉 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
 </style>""")
 
 
@@ -225,7 +275,7 @@ st.html(f'<div class="app-head"><div class="app-title">🎧 Nova&#39;s translato
 b1, b2, b4, b3 = st.columns([1, 1, 0.75, 1.2], vertical_alignment="center")
 start_clicked = stop_clicked = False
 if running:
-    stop_clicked = b1.button("⏹ Stop", use_container_width=True)
+    stop_clicked = b1.button("⏹ Stop", use_container_width=True, key="stop_btn")
 else:
     start_clicked = b1.button("● Start recording", type="primary", use_container_width=True)
 can_note = bool(sess and not sess.running and sess.segments)
@@ -259,6 +309,7 @@ if start_clicked:
                 ensure_ascii=False, indent=2), encoding="utf-8")
         ss.notes = ss.notes_path = ss.notion_url = None
         ss.clear_from = 0
+        st.session_state.animated_idx = -1
         ss.session.start()
         st.rerun()
 
@@ -295,7 +346,7 @@ if note_clicked:
                    fix_brief(sess.cfg.slide_brief, sess.cfg.slide_terms, sess.terms.fixed()))
 
 
-def seg_html(seg, show_en: bool, latest: bool) -> str:
+def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
     if seg.translation is None:
         zh = '<span class="pending">Translating…</span>'
     elif seg.error:
@@ -305,7 +356,7 @@ def seg_html(seg, show_en: bool, latest: bool) -> str:
     en = f'<div class="en">{html.escape(seg.source)}</div>' if show_en else ""
     t = f'<div class="t">{fmt_time(seg.elapsed)}</div>'
     if latest:
-        return f'<div class="latest">{t}<div class="zh">{zh}</div>{en}</div>'
+        return f'<div class="latest{" fresh" if fresh else ""}">{t}<div class="zh">{zh}</div>{en}</div>'
     return f'<div class="seg">{t}<div class="zh">{zh}</div>{en}</div>'
 
 
@@ -335,13 +386,18 @@ def live_view():
             st.text("\n".join(errors[-20:]))
 
     if partial and s.running:
-        st.html(f'<div class="listening"><b>Listening</b>{html.escape(partial)}</div>')
+        st.html(f'<div class="listening"><span class="eq"><i></i><i></i><i></i><i></i></span>'
+                f'<b>Listening</b>{html.escape(partial)}</div>')
     rows = segs[ss.clear_from:][-max_rows:]
     if newest_first:
         rows = rows[::-1]
     if rows:
         latest = rows[0] if newest_first else rows[-1]
-        st.html("".join(seg_html(seg, show_en, seg is latest) for seg in rows))
+        # 字幕區每秒重畫一次；只有新字幕翻好的那一次加 fresh，動畫才不會每秒重播
+        fresh = latest.translation is not None and latest.idx > st.session_state.get("animated_idx", -1)
+        if fresh:
+            st.session_state.animated_idx = latest.idx
+        st.html("".join(seg_html(seg, show_en, seg is latest, fresh and seg is latest) for seg in rows))
     elif s.running and ss.clear_from:
         st.caption("Screen cleared — new subtitles will appear here")
     elif s.running:
