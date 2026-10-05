@@ -16,7 +16,11 @@ import asyncio
 import hashlib
 import json
 import queue as thread_queue
+import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import wave
@@ -323,7 +327,6 @@ class SessionConfig:
     fixed_terms: dict = field(default_factory=dict)   # 使用者修正過的譯名 {原文: 中文}
     slide_brief: str = ""                              # 從簡報整理的課程背景
     slide_terms: dict = field(default_factory=dict)   # 從簡報找到的譯名 {原文: 中文}
-    max_reconnects: int = 5
     save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
@@ -350,6 +353,8 @@ class LiveSession:
         self.source_path = cfg.out_dir / "逐字稿_原文.txt"
         self.audio_path = cfg.out_dir / "錄音.flac"
         self._audio_file = None
+        self._caffeinate: Optional[subprocess.Popen] = None
+        self._producer: Optional[threading.Thread] = None
         self._written_upto = 0
         self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
 
@@ -371,8 +376,17 @@ class LiveSession:
                                                 format="FLAC", subtype="PCM_16")
             except Exception as e:
                 self._log_error(f"Could not create the audio file; saving the transcript only: {e}")
+        self._keep_awake()
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
+
+    def _keep_awake(self):
+        """錄音期間不讓 Mac 睡眠、螢幕也不自動關（-d 螢幕、-i 系統閒置；-w 程式結束就自動解除）。"""
+        if sys.platform == "darwin" and shutil.which("caffeinate"):
+            try:
+                self._caffeinate = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(os.getpid())])
+            except Exception as e:
+                self._log_error(f"Couldn't keep the Mac awake; it may sleep during class: {e}")
 
     def stop(self):
         self._stop.set()
@@ -419,9 +433,13 @@ class LiveSession:
         except Exception as e:  # 最後防線
             self._log_error(f"Unexpected error: {e!r}")
         finally:
-            if self._audio_file is not None:
+            # 錄音檔由收音執行緒負責關；收音執行緒沒啟動（例如一開始就出錯）才在這裡關
+            if self._producer is None and self._audio_file is not None:
                 self._audio_file.close()
                 self._audio_file = None
+            if self._caffeinate is not None:
+                self._caffeinate.terminate()
+                self._caffeinate = None
             self.running = False
             self.ended_at = time.time()
             self._set_status("Stopped")
@@ -429,7 +447,7 @@ class LiveSession:
     async def _main(self):
         client = self._make_client()
         self._trans_q: asyncio.Queue = asyncio.Queue()
-        producer = threading.Thread(target=self._audio_producer, daemon=True)
+        producer = self._producer = threading.Thread(target=self._audio_producer, daemon=True)
         producer.start()
         translator = asyncio.create_task(self._translator(client))
         idle = asyncio.create_task(self._idle_flusher())
@@ -456,8 +474,11 @@ class LiveSession:
             await self._trans_q.put(None)       # 通知翻譯結束
             await translator
             self._write_pending()
+            # 等收音執行緒把最後的音訊寫進錄音檔、關檔
+            await asyncio.get_running_loop().run_in_executor(None, producer.join, 10)
 
-    # 音訊：麥克風或檔案 → thread queue
+    # 音訊：麥克風或檔案 → 錄音檔 ＋ thread queue
+    # 錄音檔在這裡寫，所以網路斷掉、還沒送去辨識的音訊也會先存進錄音檔
     def _audio_producer(self):
         try:
             if self.cfg.wav_path:
@@ -466,23 +487,71 @@ class LiveSession:
                 for i in range(0, len(pcm), step):
                     if self._stop.is_set():
                         break
-                    self._audio_q.put(pcm[i:i + step])
+                    self._emit_audio(pcm[i:i + step])
                     time.sleep(CHUNK_MS / 1000 / max(self.cfg.wav_speed, 0.1))
                 self._stop.set()     # 檔案播完就自動停止
             else:
-                import sounddevice as sd
-
-                def cb(indata, frames, t, status):
-                    self._audio_q.put(bytes(indata))
-
-                with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                                       blocksize=CHUNK_SAMPLES, device=self.cfg.input_device,
-                                       callback=cb):
-                    while not self._stop.is_set():
-                        time.sleep(0.1)
+                self._mic_loop()
         except Exception as e:
             self._log_error(f"Audio input failed: {e}")
             self._stop.set()
+        finally:
+            if self._audio_file is not None:
+                self._audio_file.close()
+                self._audio_file = None
+
+    def _emit_audio(self, chunk: bytes):
+        self._save_audio(chunk)
+        self._audio_q.put(chunk)
+
+    def _mic_loop(self):
+        """
+        收麥克風，出問題就自動重新接上，直到按停止為止：
+        - 開不了、或錄到一半出錯 → 等一下再開
+        - 3 秒都沒收到聲音（例如拔掉外接麥克風）→ 當作斷線，重新開
+        - 指定的麥克風連續失敗 3 次 → 改用系統預設麥克風
+        """
+        import sounddevice as sd
+        raw_q: "thread_queue.Queue[bytes]" = thread_queue.Queue()
+        device, failures = self.cfg.input_device, 0
+
+        def cb(indata, frames, t, status):
+            raw_q.put(bytes(indata))
+
+        while not self._stop.is_set():
+            try:
+                with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                                       blocksize=CHUNK_SAMPLES, device=device, callback=cb) as stream:
+                    last_data = time.monotonic()
+                    while not self._stop.is_set():
+                        try:
+                            self._emit_audio(raw_q.get(timeout=0.2))
+                        except thread_queue.Empty:
+                            if not stream.active or time.monotonic() - last_data > 3:
+                                raise RuntimeError("no sound from the microphone for 3 seconds")
+                            continue
+                        last_data = time.monotonic()
+                        if failures:
+                            self._log_error("Microphone reconnected")
+                            self._set_status("Recording")
+                            failures = 0
+            except Exception as e:
+                if self._stop.is_set():
+                    break
+                failures += 1
+                self._log_error(f"Microphone problem (attempt {failures}): {e}")
+                self._set_status("Microphone disconnected — reconnecting…")
+                if device is not None and failures >= 3:
+                    self._log_error("Switching to the system default microphone")
+                    device = None
+                self._stop.wait(min(failures, 5))   # 等的時候按停止也能馬上結束
+                try:   # 重新整理裝置清單，才找得到重新插上的麥克風
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+        while not raw_q.empty():
+            self._emit_audio(raw_q.get_nowait())
 
     async def _audio_stream(self) -> AsyncIterator[bytes]:
         loop = asyncio.get_running_loop()
@@ -494,11 +563,10 @@ class LiveSession:
                     return
                 continue
             self.audio_seconds += len(chunk) / 2 / SAMPLE_RATE
-            self._save_audio(chunk)
             yield chunk
 
     def _save_audio(self, chunk: bytes):
-        """送去辨識的每一段音訊，同時寫進錄音檔（重連時排隊的音訊也會寫到）。"""
+        """收到的每一段音訊寫進錄音檔（在收音執行緒呼叫，跟網路狀況無關）。"""
         if self._audio_file is None:
             return
         try:
@@ -540,13 +608,14 @@ class LiveSession:
                         if not self._stop.is_set():
                             self._set_status("Recording")
             except Exception as e:
+                # 沒按停止就一直重連（例如教室 Wi-Fi 斷了一陣子）；斷線期間的音訊會排隊，連上後一起補送
                 failures += 1
                 self._log_error(f"Connection lost (attempt {failures}): {e}")
-                if failures > self.cfg.max_reconnects:
-                    self._log_error("Too many reconnection attempts; recording stopped. The transcript has been saved.")
-                    self._stop.set()
-                    return
-                await asyncio.sleep(min(2 * failures, 10))
+                self._set_status(f"Connection lost — reconnecting (attempt {failures})…")
+                for _ in range(min(2 * failures, 10) * 5):
+                    if self._stop.is_set():
+                        break
+                    await asyncio.sleep(0.2)
             if self._stop.is_set():
                 return
             # 伺服器結束了這次連線但使用者沒按停止 → 自動重連
