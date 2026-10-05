@@ -93,7 +93,8 @@ st.html("""<style>
 .listening { color: var(--muted); font-size:.92rem; padding:.2rem .1rem .8rem; }
 .listening b { color: var(--accent); font-weight:600; margin-right:.4rem; }
 .latest { border:1px solid #2f3b55; border-left:4px solid var(--accent); border-radius:12px;
-  background:linear-gradient(180deg,#18202f,#151a24); padding:1rem 1.2rem; margin-bottom:1rem; }
+  background:linear-gradient(180deg,#18202f,#151a24); padding:1rem 1.2rem; }
+.latest-wrap { margin-bottom:1rem; }
 .latest .zh { font-size:1.75rem; line-height:1.6; font-weight:500; }
 .latest .en { color: var(--muted); font-size:1rem; margin-top:.45rem; line-height:1.5; }
 .seg { display:grid; grid-template-columns: 4.6rem 1fr; gap:.2rem .9rem; padding:.75rem .2rem; border-bottom:1px solid var(--line); }
@@ -279,6 +280,30 @@ st.html("""<style>
   background: var(--c); box-shadow: 0 0 12px var(--c); }
 .st-key-grp_class h4, .st-key-grp_audio h4, .st-key-grp_terms h4 { color: var(--c); padding-top: .1rem; }
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .9rem; }
+
+/* ---------- 主畫面卡片：滑鼠移上去光沿著外框繞圈 ---------- */
+/* 用兩個疊在卡片上的圈來畫，不動卡片本身的背景：before＝外框上那道光，after＝外面的光暈 */
+.empty, .latest-wrap, .st-key-notes { position: relative; --c: #6ea8fe; }
+.empty { border-radius: 14px; --r: 14px; animation: fadeIn .6s ease-out both, spin 2.4s linear infinite; }
+.latest-wrap { border-radius: 12px; --r: 12px; animation: spin 2.4s linear infinite; }
+.st-key-notes { border-radius: 12px; --r: 12px; --c: #a78bfa; animation: riseIn .5s ease-out both, spin 2.4s linear infinite; }
+.empty::before, .latest-wrap::before, .st-key-notes::before {
+  content:""; position:absolute; inset:0; padding:1.5px; border-radius: var(--r); pointer-events:none; z-index:3;
+  background: conic-gradient(from var(--a), transparent 0deg, var(--c) 50deg, #ffffff 70deg, var(--c) 90deg,
+                             transparent 140deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite; }
+.empty::after, .latest-wrap::after, .st-key-notes::after {
+  content:""; position:absolute; inset:-12px; padding:12px; border-radius: calc(var(--r) + 12px);
+  pointer-events:none; z-index:0;
+  background: conic-gradient(from var(--a), transparent 0deg, var(--c) 60deg, transparent 140deg, transparent 360deg);
+  filter: blur(8px);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite; }
+.empty:hover::before, .latest-wrap:hover::before, .st-key-notes:hover::before { opacity: 1; }
+.empty:hover::after, .latest-wrap:hover::after, .st-key-notes:hover::after { opacity: .9; }
 
 /* 系統設定「減少動態效果」時全部關掉 */
 @media (prefers-reduced-motion: reduce) {
@@ -492,7 +517,9 @@ def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
     en = f'<div class="en">{html.escape(seg.source)}</div>' if show_en else ""
     t = f'<div class="t">{fmt_time(seg.elapsed)}</div>'
     if latest:
-        return f'<div class="latest{" fresh" if fresh else ""}">{t}<div class="zh">{zh}</div>{en}</div>'
+        # 外面多包一層：最新字幕卡本身要裁掉掃光，滑鼠光暈畫在外層才不會被裁掉
+        return (f'<div class="latest-wrap"><div class="latest{" fresh" if fresh else ""}">'
+                f'{t}<div class="zh">{zh}</div>{en}</div></div>')
     return f'<div class="seg">{t}<div class="zh">{zh}</div>{en}</div>'
 
 
