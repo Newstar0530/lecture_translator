@@ -1,3 +1,12 @@
 # 只讓這台電腦自己連線，同一個 Wi-Fi 的其他人連不進來
 [server]
 address = "localhost"
+
+# 深色主題：教室裡比較不刺眼
+[theme]
+base = "dark"
+primaryColor = "#6ea8fe"
+backgroundColor = "#0f1218"
+secondaryBackgroundColor = "#161a22"
+textColor = "#e6e8ee"
+borderColor = "#262b36"
