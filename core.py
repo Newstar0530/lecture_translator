@@ -309,6 +309,7 @@ class SessionConfig:
     slide_brief: str = ""                              # 從簡報整理的課程背景
     slide_terms: dict = field(default_factory=dict)   # 從簡報找到的譯名 {原文: 中文}
     max_reconnects: int = 5
+    save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
 class LiveSession:
@@ -332,6 +333,8 @@ class LiveSession:
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
         self.source_path = cfg.out_dir / "逐字稿_原文.txt"
+        self.audio_path = cfg.out_dir / "錄音.flac"
+        self._audio_file = None
         self._written_upto = 0
         self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
 
@@ -346,6 +349,13 @@ class LiveSession:
             title = self.cfg.course or "上課逐字稿"
             f.write(f"# {title}\n\n錄音開始：{datetime.now():%Y-%m-%d %H:%M}\n\n")
         self.source_path.write_text("", encoding="utf-8")
+        if self.cfg.save_audio:
+            try:
+                import soundfile as sf
+                self._audio_file = sf.SoundFile(self.audio_path, "w", samplerate=SAMPLE_RATE, channels=1,
+                                                format="FLAC", subtype="PCM_16")
+            except Exception as e:
+                self._log_error(f"無法建立錄音檔，這次只存逐字稿：{e}")
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -394,6 +404,9 @@ class LiveSession:
         except Exception as e:  # 最後防線
             self._log_error(f"程式錯誤：{e!r}")
         finally:
+            if self._audio_file is not None:
+                self._audio_file.close()
+                self._audio_file = None
             self.running = False
             self.ended_at = time.time()
             self._set_status("已停止")
@@ -466,7 +479,18 @@ class LiveSession:
                     return
                 continue
             self.audio_seconds += len(chunk) / 2 / SAMPLE_RATE
+            self._save_audio(chunk)
             yield chunk
+
+    def _save_audio(self, chunk: bytes):
+        """送去辨識的每一段音訊，同時寫進錄音檔（重連時排隊的音訊也會寫到）。"""
+        if self._audio_file is None:
+            return
+        try:
+            self._audio_file.write(np.frombuffer(chunk, dtype=np.int16))
+        except Exception as e:
+            self._log_error(f"錄音檔寫入失敗，之後只存逐字稿：{e}")
+            self._audio_file = None
 
     async def _stt_loop(self, client):
         from mistralai.client.models import (AudioFormat, RealtimeTranscriptionError,

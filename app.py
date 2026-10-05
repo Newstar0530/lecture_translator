@@ -185,6 +185,8 @@ with st.sidebar:
                 tmp.write_bytes(up.getvalue())
                 st.session_state.uploaded_id = up.file_id
             wav_path = str(tmp)
+    save_audio = st.toggle("同時保存錄音檔（FLAC）", value=True,
+                           help="存在這堂課的資料夾，可以之後重聽。每小時約 60–90 MB，不影響辨識和費用")
 
     terms_slot = st.container()   # 修正譯名（函式在檔案最後定義）
 
@@ -229,7 +231,7 @@ if start_clicked:
                             input_device=device, wav_path=wav_path, wav_speed=wav_speed,
                             min_chars=min_chars, fixed_terms=load_fixed_terms(course),
                             slide_brief=slides["summary"] if slides else "",
-                            slide_terms=slides["terms"] if slides else {})
+                            slide_terms=slides["terms"] if slides else {}, save_audio=save_audio)
         ss.session = LiveSession(cfg)
         if slides:   # 存一份，之後從舊逐字稿產生筆記時也能用
             (out_dir / SLIDES_FILE).write_text(json.dumps(
