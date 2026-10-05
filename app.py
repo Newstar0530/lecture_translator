@@ -63,12 +63,10 @@ ss = get_shared_state()
 # ---------------------------------------------------------------- 側邊欄
 with st.sidebar:
     st.header("設定")
-    # .env 的金鑰只留在本機程式裡，不送到瀏覽器
-    env_key = load_env_key()
-    typed_key = st.text_input("Mistral API Key", type="password",
-                              placeholder="已從 .env 讀取，不用填" if env_key else "",
-                              help="建議寫在 .env 檔，就不用每次貼上")
-    api_key = typed_key or env_key
+    # 金鑰只從 .env（或環境變數）讀取，留在本機程式裡，不送到瀏覽器
+    api_key = load_env_key()
+    if not api_key:
+        st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     course = st.text_input("課程名稱", placeholder="例如：Strategies in the arts")
 
     # 每門課一份詞彙表，存在 詞彙表/課程名稱.txt，下次填同一個課程名稱會自動載入
@@ -124,7 +122,7 @@ running = bool(sess and sess.running)
 c1, c2, c3 = st.columns(3)
 if c1.button("▶ 開始", type="primary", disabled=running, use_container_width=True):
     if not api_key:
-        st.error("請先在左邊輸入 Mistral API Key")
+        st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     elif source != "麥克風" and not wav_path:
         st.error("請先上傳 WAV 檔")
     else:
@@ -162,7 +160,7 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path, gloss
 can_note = bool(sess and not sess.running and sess.segments)
 if c3.button("📝 產生筆記", disabled=not can_note, use_container_width=True):
     if not api_key:
-        st.error("請先在左邊輸入 Mistral API Key")
+        st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
                    f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir, sess.cfg.glossary)
@@ -179,7 +177,7 @@ with st.expander("📂 從之前的逐字稿產生筆記"):
                             format_func=lambda d: d.name + ("（已有筆記）" if (d / "筆記.md").exists() else ""))
         if st.button("📝 用這份逐字稿產生筆記", disabled=running and sess.cfg.out_dir == pick):
             if not api_key:
-                st.error("請先在左邊輸入 Mistral API Key")
+                st.error("找不到 Mistral API Key：請照 README 建立 .env 檔，再重新啟動程式")
             else:
                 # 資料夾名稱格式：日期_時間_課程名稱
                 date_str, _, rest = pick.name.partition("_")
