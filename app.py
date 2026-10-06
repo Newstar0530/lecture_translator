@@ -423,7 +423,8 @@ with st.sidebar:
 sess: LiveSession | None = ss.session
 running = bool(sess and sess.running)
 
-shown_course = (sess.cfg.course if sess else course) or "Untitled course"
+# 錄音中顯示這堂課的名稱；沒在錄音時顯示左邊剛輸入的名稱（下一堂課要用的）
+shown_course = (sess.cfg.course if running else course or (sess.cfg.course if sess else "")) or "Untitled course"
 st.html(f'<div class="app-head"><div class="app-title"><span class="icon">🎧</span> <span class="grad">Nova&#39;s translator</span></div>'
         f'<div class="app-sub">{html.escape(shown_course)}</div></div>')
 b1, b2, b4, b3 = st.columns([1, 1, 0.75, 1.2], vertical_alignment="center")
