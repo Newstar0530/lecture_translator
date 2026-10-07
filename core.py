@@ -608,8 +608,10 @@ class LiveSession:
                     elif isinstance(ev, TranscriptionStreamDone):
                         break
                     elif isinstance(ev, RealtimeTranscriptionError):
+                        # 伺服器那邊出錯（例如逾時、辨識引擎當掉）：這條連線通常已經壞了，
+                        # 直接斷開重連，不要一直等；還沒送出的音訊會在重連後補送
                         msg = ev.error.message
-                        self._log_error(f"Speech recognition error: {getattr(msg, 'detail', msg)}")
+                        raise ConnectionError(f"speech recognition server error: {getattr(msg, 'detail', msg)}")
                     elif getattr(ev, "type", None) in ("session.created", "session.updated"):
                         if not self._stop.is_set():
                             self._set_status("Recording")
