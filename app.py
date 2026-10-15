@@ -161,7 +161,7 @@ st.html("""<style>
 /* 極光背景：藍紫色光暈在深色背景後面緩慢飄動 */
 [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] { background: transparent !important; }
 [data-testid="stAppViewContainer"] { z-index: 1; }   /* 只調圖層，不能改 position，否則整頁會變得不能捲動 */
-.stApp::before { content:""; position:fixed; inset:-25%; z-index:0; pointer-events:none; will-change: transform;
+.stApp::before { content:""; position:fixed; inset:-25%; z-index:0; pointer-events:none;
   background:
     radial-gradient(38% 32% at 22% 18%, rgba(110,168,254,.34), transparent 70%),
     radial-gradient(34% 30% at 82% 22%, rgba(167,139,250,.28), transparent 70%),
@@ -177,11 +177,12 @@ st.html("""<style>
 @keyframes flow { from { background-position: 0% 0; } to { background-position: 300% 0; } }
 
 /* 玻璃卡片 */
-.statusbar, .empty, .st-key-notes { background: rgba(22,26,34,.82) !important; border-color: rgba(255,255,255,.07) !important; }
+.statusbar, .empty, .st-key-notes { background: rgba(22,26,34,.55) !important; backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px); border-color: rgba(255,255,255,.07) !important; }
 .latest { border: 1px solid transparent; border-left-width: 1px;
   background: linear-gradient(180deg, rgba(26,34,52,.82), rgba(20,25,36,.82)) padding-box,
               linear-gradient(135deg, rgba(110,168,254,.85), rgba(167,139,250,.55) 50%, rgba(45,212,191,.45)) border-box;
-}
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
 
 /* 新字幕一個字一個字亮起來 */
 .ch { opacity: 0; animation: charIn .35s ease-out forwards; }
@@ -211,10 +212,10 @@ st.html("""<style>
   animation: spin 6s linear infinite;
   box-shadow: 0 10px 40px -12px rgba(110,168,254,.35); }
 /* 全息光澤：每隔幾秒一道斜光掃過卡片 */
-.latest::after { content:""; position:absolute; top:-50%; left:0; width:35%; height:200%; pointer-events:none;
+.latest::after { content:""; position:absolute; top:-50%; left:-60%; width:35%; height:200%; pointer-events:none;
   background: linear-gradient(100deg, transparent, rgba(167,139,250,.10), rgba(255,255,255,.12), rgba(110,168,254,.10), transparent);
-  transform: translateX(-150%) rotate(12deg); animation: sheen 5.5s ease-in-out infinite; will-change: transform; }
-@keyframes sheen { 0%, 55% { transform: translateX(-150%) rotate(12deg); } 100% { transform: translateX(560%) rotate(12deg); } }
+  transform: rotate(12deg); animation: sheen 5.5s ease-in-out infinite; }
+@keyframes sheen { 0%, 55% { left:-60%; } 100% { left:130%; } }
 
 /* 錄音中＝直播模式：背景極光變亮，頁面最上面一條流動的光 */
 .stApp::before { transition: filter 1.2s ease, opacity 1.2s ease; }
@@ -234,7 +235,7 @@ st.html("""<style>
     radial-gradient(1px 1px at 46% 88%, rgba(255,255,255,.4), transparent 60%),
     radial-gradient(1.3px 1.3px at 22% 52%, rgba(110,168,254,.5), transparent 60%),
     radial-gradient(1px 1px at 67% 32%, rgba(167,139,250,.5), transparent 60%);
-  background-size: 520px 520px; animation: twinkle 6s ease-in-out infinite alternate; will-change: opacity; }
+  background-size: 520px 520px; animation: twinkle 6s ease-in-out infinite alternate; }
 @keyframes twinkle { from { opacity:.35; } to { opacity:.9; } }
 
 /* 標題：字發光、耳機輕輕上下浮動 */
@@ -255,8 +256,7 @@ st.html("""<style>
               linear-gradient(150deg, var(--c), rgba(255,255,255,.04) 55%, rgba(255,255,255,.08)) border-box;
   box-shadow: 0 8px 26px -14px var(--c); position: relative;
   /* 進場動畫和繞圈的角度同時設好，滑鼠移進移出都不改 animation，進場動畫才不會重播 */
-  transition: box-shadow .2s ease; animation: riseIn .5s ease-out both, spin 2.4s linear infinite;
-  animation-play-state: running, paused; }
+  transition: box-shadow .2s ease; animation: riseIn .5s ease-out both, spin 2.4s linear infinite; }
 .st-key-grp_audio { --c: #a78bfa; animation-delay: .08s, 0s; }
 .st-key-grp_terms { --c: #2dd4bf; animation-delay: .16s, 0s; }
 /* 滑鼠移上去：一道光沿著外框繞圈，外面跟著一圈柔和的光暈 */
@@ -268,13 +268,12 @@ st.html("""<style>
 .st-key-grp_class::after, .st-key-grp_audio::after, .st-key-grp_terms::after {
   content:""; position:absolute; inset:-12px; padding:12px; border-radius:28px; z-index:-1; pointer-events:none;
   background: conic-gradient(from var(--a), transparent 0deg, var(--c) 60deg, transparent 140deg, transparent 360deg);
-  filter: blur(8px); opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite paused;
+  filter: blur(8px); opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite;
   /* 只留卡片外面那一圈，光暈才不會蓋到卡片裡面的內容 */
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask-composite: exclude; }
 .st-key-grp_class:hover::after, .st-key-grp_audio:hover::after, .st-key-grp_terms:hover::after {
-  opacity: .9; animation-play-state: running; }
-.st-key-grp_class:hover, .st-key-grp_audio:hover, .st-key-grp_terms:hover { animation-play-state: running, running; }
+  opacity: .9; }
 /* 卡片左上角一條發光短線，和標題用同一個顏色 */
 .st-key-grp_class::before, .st-key-grp_audio::before, .st-key-grp_terms::before {
   content:""; position:absolute; top:-1px; left:18px; width:42px; height:3px; border-radius:3px;
@@ -285,16 +284,16 @@ st.html("""<style>
 /* ---------- 主畫面卡片：滑鼠移上去光沿著外框繞圈 ---------- */
 /* 用兩個疊在卡片上的圈來畫，不動卡片本身的背景：before＝外框上那道光，after＝外面的光暈 */
 .empty, .latest-wrap, .st-key-notes { position: relative; --c: #6ea8fe; }
-.empty { border-radius: 14px; --r: 14px; animation: fadeIn .6s ease-out both; }
-.latest-wrap { border-radius: 12px; --r: 12px; }
-.st-key-notes { border-radius: 12px; --r: 12px; --c: #a78bfa; animation: riseIn .5s ease-out both; }
+.empty { border-radius: 14px; --r: 14px; animation: fadeIn .6s ease-out both, spin 2.4s linear infinite; }
+.latest-wrap { border-radius: 12px; --r: 12px; animation: spin 2.4s linear infinite; }
+.st-key-notes { border-radius: 12px; --r: 12px; --c: #a78bfa; animation: riseIn .5s ease-out both, spin 2.4s linear infinite; }
 .empty::before, .latest-wrap::before, .st-key-notes::before {
   content:""; position:absolute; inset:0; padding:1.5px; border-radius: var(--r); pointer-events:none; z-index:3;
   background: conic-gradient(from var(--a), transparent 0deg, var(--c) 50deg, #ffffff 70deg, var(--c) 90deg,
                              transparent 140deg, transparent 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask-composite: exclude;
-  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite paused; }
+  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite; }
 .empty::after, .latest-wrap::after, .st-key-notes::after {
   content:""; position:absolute; inset:-12px; padding:12px; border-radius: calc(var(--r) + 12px);
   pointer-events:none; z-index:0;
@@ -302,9 +301,9 @@ st.html("""<style>
   filter: blur(8px);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask-composite: exclude;
-  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite paused; }
-.empty:hover::before, .latest-wrap:hover::before, .st-key-notes:hover::before { opacity: 1; animation-play-state: running; }
-.empty:hover::after, .latest-wrap:hover::after, .st-key-notes:hover::after { opacity: .9; animation-play-state: running; }
+  opacity: 0; transition: opacity .3s ease; animation: spin 2.4s linear infinite; }
+.empty:hover::before, .latest-wrap:hover::before, .st-key-notes:hover::before { opacity: 1; }
+.empty:hover::after, .latest-wrap:hover::after, .st-key-notes:hover::after { opacity: .9; }
 
 /* 系統設定「減少動態效果」時全部關掉 */
 @media (prefers-reduced-motion: reduce) {
