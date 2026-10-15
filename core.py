@@ -253,10 +253,21 @@ def terms_in(text: str, terms: dict[str, str]) -> dict[str, str]:
     return {en: zh for en, zh in terms.items() if en.lower() in low}
 
 
+LANGUAGES = {"English": "英文", "French": "法文"}
+
+
+def language_prompt(language: str) -> str:
+    """告訴模型這堂課主要用哪個語言授課（語音辨識模型沒有語言設定，會自動判斷，所以只用在翻譯和筆記）。"""
+    zh = LANGUAGES.get(language)
+    if not zh:
+        return ""
+    return f"\n\n這堂課主要用{zh}授課，逐字稿大多是{zh}（偶爾可能夾雜其他語言），請照{zh}的語意理解後翻譯。"
+
+
 def build_translate_messages(context: str, text: str, glossary: Optional[dict[str, str]] = None,
-                             background: str = "") -> list[dict]:
+                             background: str = "", language: str = "") -> list[dict]:
     user = (f"前文（不用翻譯）：{context}\n\n" if context else "") + f"要翻譯的片段：\n{text}"
-    system = TRANSLATE_SYSTEM + background_prompt(background) + glossary_prompt(glossary or {})
+    system = TRANSLATE_SYSTEM + language_prompt(language) + background_prompt(background) + glossary_prompt(glossary or {})
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -328,6 +339,7 @@ class SessionConfig:
     fixed_terms: dict = field(default_factory=dict)   # 使用者修正過的譯名 {原文: 中文}
     slide_brief: str = ""                              # 從簡報整理的課程背景
     slide_terms: dict = field(default_factory=dict)   # 從簡報找到的譯名 {原文: 中文}
+    language: str = "English"                         # 主要授課語言：English / French
     save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
@@ -656,7 +668,8 @@ class LiveSession:
                     glossary = self.terms.relevant(f"{context} {seg.source}")
                     brief = fix_brief(self.cfg.slide_brief, self.cfg.slide_terms, self.terms.fixed())
                     resp = await self._client_chat(client, self.cfg.translate_model,
-                                                   build_translate_messages(context, seg.source, glossary, brief),
+                                                   build_translate_messages(context, seg.source, glossary, brief,
+                                                                            self.cfg.language),
                                                    temperature=0.2, response_format={"type": "json_object"})
                     text, terms = parse_translation(_message_text(resp))
                     for en, zh in terms:
@@ -744,7 +757,8 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                    model: str = DEFAULT_NOTES_MODEL, client=None,
                    progress: Optional[Callable[[str], None]] = None,
                    cache_dir: Optional[Path] = None, retries: int = 4,
-                   glossary: Optional[dict[str, str]] = None, background: str = "") -> str:
+                   glossary: Optional[dict[str, str]] = None, background: str = "",
+                   language: str = "") -> str:
     """
     分段整理逐字稿，再合併成一份筆記。
     cache_dir：每段整理好就先存檔；中途失敗後再按一次，已完成的段落直接沿用，不會重複扣費。
@@ -774,7 +788,8 @@ def generate_notes(api_key: str, transcript: str, course: str, date_str: str,
                 time.sleep(wait)
 
     # 只給逐字稿裡真的出現過的名詞，避免模型把簡報上的名詞當成上課內容寫進筆記
-    extra = background_prompt(background) + glossary_prompt(terms_in(transcript, glossary or {}))
+    extra = (language_prompt(language) + background_prompt(background)
+             + glossary_prompt(terms_in(transcript, glossary or {})))
     chunk_system = NOTES_CHUNK_SYSTEM + extra
     merge_system = NOTES_MERGE_SYSTEM + extra
 

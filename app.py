@@ -340,6 +340,9 @@ with st.sidebar:
     with st.container(key="grp_class"):
         st.markdown("#### Lecture information")
         course = st.text_input("Course name")
+        language = st.selectbox("Lecture language", ["English", "French"], index=0,
+                                help="The main language of this class. Speech recognition detects the language "
+                                     "automatically; this tells translation and notes what to expect")
 
         # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
         slides_file = st.file_uploader("Lecture slides", type=["pdf", "pptx"],
@@ -458,7 +461,8 @@ if start_clicked:
                             input_device=device, wav_path=wav_path, wav_speed=wav_speed,
                             min_chars=min_chars, fixed_terms=load_fixed_terms(course),
                             slide_brief=slides["summary"] if slides else "",
-                            slide_terms=slides["terms"] if slides else {}, save_audio=save_audio)
+                            slide_terms=slides["terms"] if slides else {}, save_audio=save_audio,
+                            language=language)
         ss.session = LiveSession(cfg)
         if slides:   # 存一份，之後從舊逐字稿產生筆記時也能用
             (out_dir / SLIDES_FILE).write_text(json.dumps(
@@ -476,13 +480,14 @@ if stop_clicked:
 
 
 def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
-               glossary: dict[str, str], background: str):
+               glossary: dict[str, str], background: str, language: str = ""):
     """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
     cache_dir = out_dir / ".筆記暫存"
     with st.status("Generating notes…", expanded=True) as box:
         try:
             notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
-                                   progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background)
+                                   progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background,
+                                   language=language)
             path = out_dir / "筆記.md"
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -500,7 +505,8 @@ if note_clicked:
         make_notes(sess.full_source_text(), sess.cfg.course,
                    f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir,
                    merge_terms(sess.cfg.slide_terms, sess.terms.fixed()),
-                   fix_brief(sess.cfg.slide_brief, sess.cfg.slide_terms, sess.terms.fixed()))
+                   fix_brief(sess.cfg.slide_brief, sess.cfg.slide_terms, sess.terms.fixed()),
+                   sess.cfg.language)
 
 
 def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
@@ -651,7 +657,8 @@ if saved:
                 info = load_slides_info(pick)
                 slide_terms, fixed = info.get("terms", {}), load_fixed_terms(course_name)
                 make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"), course_name, date_str, pick,
-                           merge_terms(slide_terms, fixed), fix_brief(info.get("summary", ""), slide_terms, fixed))
+                           merge_terms(slide_terms, fixed), fix_brief(info.get("summary", ""), slide_terms, fixed),
+                           language)
 
 
 # ---------------------------------------------------------------- 側邊欄：修正譯名、進階設定
