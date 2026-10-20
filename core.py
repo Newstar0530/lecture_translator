@@ -368,6 +368,8 @@ class LiveSession:
         self._audio_file = None
         self._caffeinate: Optional[subprocess.Popen] = None
         self._producer: Optional[threading.Thread] = None
+        self._last_text_at = time.monotonic()      # 最後一次收到辨識文字的時間（卡死偵測用）
+        self._loud_since_text = 0                   # 那之後收到幾格明顯的說話聲
         self.levels: deque[float] = deque(maxlen=20)   # 最近 2 秒的音量（每 100 毫秒一格，0–1），畫音量表用
         self._written_upto = 0
         self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
@@ -520,7 +522,10 @@ class LiveSession:
         # 音量換成 dB，-60 dB（幾乎沒聲音）到 -10 dB（很大聲）對應到 0–1
         rms = float(np.sqrt(np.mean(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) ** 2))) if chunk else 0.0
         db = 20 * np.log10(max(rms, 1.0) / 32768)
-        self.levels.append(min(max((db + 60) / 50, 0.0), 1.0))
+        level = min(max((db + 60) / 50, 0.0), 1.0)
+        self.levels.append(level)
+        if level >= self.LOUD_LEVEL:
+            self._loud_since_text += 1
 
     def _mic_loop(self):
         """
@@ -593,40 +598,69 @@ class LiveSession:
             self._log_error(f"Writing the audio file failed; saving the transcript only from now on: {e}")
             self._audio_file = None
 
+    # 卡死偵測：麥克風這段時間一直有人在講話，卻超過 STALL_SECONDS 秒沒有任何文字回來 → 當作連線卡死，重連
+    STALL_SECONDS = 30
+    STALL_LOUD_CHUNKS = 150        # 15 秒（每格 100 毫秒）音量明顯的聲音
+    LOUD_LEVEL = 0.5               # 約 -35 dB，一般講話的音量；教室底噪通常在這以下
+
     async def _stt_loop(self, client):
         from mistralai.client.models import (AudioFormat, RealtimeTranscriptionError,
                                              TranscriptionStreamDone, TranscriptionStreamLanguage,
                                              TranscriptionStreamTextDelta)
         fmt = AudioFormat(encoding="pcm_s16le", sample_rate=SAMPLE_RATE)
         failures = 0
+
+        async def consume(stream):
+            nonlocal failures
+            async for ev in stream:
+                if isinstance(ev, TranscriptionStreamTextDelta):
+                    failures = 0
+                    self._last_text_at = time.monotonic()
+                    self._loud_since_text = 0
+                    if not self._stop.is_set():
+                        self._set_status("Recording")
+                    with self.lock:
+                        pieces = self._buffer.add(ev.text)
+                    for p in pieces:
+                        self._add_segment(p)
+                elif isinstance(ev, TranscriptionStreamLanguage):
+                    with self.lock:
+                        self.language = ev.audio_language
+                elif isinstance(ev, TranscriptionStreamDone):
+                    return
+                elif isinstance(ev, RealtimeTranscriptionError):
+                    # 伺服器那邊出錯（例如逾時、辨識引擎當掉）：這條連線通常已經壞了，
+                    # 直接斷開重連，不要一直等；還沒送出的音訊會在重連後補送
+                    msg = ev.error.message
+                    raise ConnectionError(f"speech recognition server error: {getattr(msg, 'detail', msg)}")
+                elif getattr(ev, "type", None) in ("session.created", "session.updated"):
+                    if not self._stop.is_set():
+                        self._set_status("Recording")
+
         while True:
             self._set_status("Connecting…")
             try:
                 kwargs = dict(audio_stream=self._audio_stream(), model=self.cfg.stt_model, audio_format=fmt)
                 if self.cfg.target_delay_ms:
                     kwargs["target_streaming_delay_ms"] = self.cfg.target_delay_ms
-                async for ev in client.audio.realtime.transcribe_stream(**kwargs):
-                    if isinstance(ev, TranscriptionStreamTextDelta):
-                        failures = 0
-                        if not self._stop.is_set():
-                            self._set_status("Recording")
-                        with self.lock:
-                            pieces = self._buffer.add(ev.text)
-                        for p in pieces:
-                            self._add_segment(p)
-                    elif isinstance(ev, TranscriptionStreamLanguage):
-                        with self.lock:
-                            self.language = ev.audio_language
-                    elif isinstance(ev, TranscriptionStreamDone):
-                        break
-                    elif isinstance(ev, RealtimeTranscriptionError):
-                        # 伺服器那邊出錯（例如逾時、辨識引擎當掉）：這條連線通常已經壞了，
-                        # 直接斷開重連，不要一直等；還沒送出的音訊會在重連後補送
-                        msg = ev.error.message
-                        raise ConnectionError(f"speech recognition server error: {getattr(msg, 'detail', msg)}")
-                    elif getattr(ev, "type", None) in ("session.created", "session.updated"):
-                        if not self._stop.is_set():
-                            self._set_status("Recording")
+                self._last_text_at = time.monotonic()
+                self._loud_since_text = 0
+                consumer = asyncio.create_task(consume(client.audio.realtime.transcribe_stream(**kwargs)))
+                # 一邊收結果，一邊每秒檢查有沒有卡死（連線沒斷、也沒報錯，但一直不回文字）
+                while not consumer.done():
+                    await asyncio.sleep(1)
+                    stalled = (not self._stop.is_set()
+                               and time.monotonic() - self._last_text_at > self.STALL_SECONDS
+                               and self._loud_since_text >= self.STALL_LOUD_CHUNKS)
+                    if stalled:
+                        consumer.cancel()
+                        try:
+                            await consumer
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        raise ConnectionError(f"no text for {self.STALL_SECONDS}s although the microphone "
+                                              "hears speech — restarting the connection")
+                await consumer          # 把 consume 裡的錯誤丟出來
             except Exception as e:
                 # 沒按停止就一直重連（例如教室 Wi-Fi 斷了一陣子）；斷線期間的音訊會排隊，連上後一起補送
                 failures += 1
