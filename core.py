@@ -39,7 +39,7 @@ CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 REALTIME_PRICE_PER_MIN = 0.006   # 美元／分鐘（2026 年官方公告價格，可能變動）
 
 DEFAULT_STT_MODEL = "voxtral-mini-transcribe-realtime-2602"
-DEFAULT_TRANSLATE_MODEL = "mistral-small-latest"
+DEFAULT_TRANSLATE_MODEL = "mistral-small-2603"   # 固定版本（＝ 2026-10 的 mistral-small-latest），研究期間才不會被自動換掉
 DEFAULT_NOTES_MODEL = "mistral-medium-latest"
 DEFAULT_SLIDES_MODEL = "mistral-large-latest"   # 讀簡報只跑一次，用最強的模型
 
@@ -654,6 +654,11 @@ class LiveSession:
                                 "idle_seconds": b.idle_seconds, "comma_seconds": b.comma_seconds,
                                 "comma_chars": b.comma_chars},
             "translation_retry": "3 attempts; wait 5*(n) s on 429, else 1.5*(n) s",
+            "health_log": {"loud_chunks, chunks, text_chars": "counts over the previous 1 s (reset every tick)",
+                           "since_last_text_seconds, down, audio_sent_seconds, backlog_seconds":
+                               "instantaneous value at the tick",
+                           "loud_chunk": f"{CHUNK_MS} ms chunk with level >= {self.LOUD_LEVEL}"},
+            "ui_refresh_seconds": 1.0,
         }
         try:
             (self.cfg.out_dir / CONFIG_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str),

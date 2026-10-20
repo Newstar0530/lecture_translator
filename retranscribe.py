@@ -17,10 +17,10 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from core import (DEFAULT_TRANSLATE_MODEL, _message_text, build_translate_messages, fmt_time,
+from core import (CONFIG_FILE, DEFAULT_TRANSLATE_MODEL, _message_text, build_translate_messages, fmt_time,
                   merge_terms, parse_translation, terms_in)
 
-BATCH_STT_MODEL = "voxtral-mini-latest"
+BATCH_STT_MODEL = "voxtral-mini-2602"   # 固定版本（＝ 2026-10 的 voxtral-mini-latest），參考時間軸才不會中途換模型
 PART_SECONDS = 600            # 每段 10 分鐘
 CUT_SEARCH_SECONDS = 30       # 在每段結尾前 30 秒內找最安靜的地方切
 LANG_CODES = {"English": "en", "French": "fr"}
@@ -115,6 +115,18 @@ def write_reference_timeline(path: Path, words: list[Word]):
         w.writerows((round(a, 2), round(b, 2), t.strip()) for a, b, t in words)
 
 
+def _note_config(out_dir: Path, info: dict):
+    """把課後重新辨識用的模型和參數記進這堂課的 設定.json（沒有就新建）。"""
+    import json
+    path = out_dir / CONFIG_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data["retranscribe"] = info
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
 def _translate_line(client, lines: list[Line], i: int, glossary: dict[str, str], background: str,
                     language: str, model: str) -> str:
     context = " ".join(t for _, t in lines[max(0, i - 2):i])
@@ -165,6 +177,9 @@ def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "Engl
             say(f"Transcribed {n}/{len(parts)}")
     words = [w for i in sorted(results) for w in results[i]]
     write_reference_timeline(out_dir / REFERENCE_TIMELINE, words)
+    _note_config(out_dir, {"model": BATCH_STT_MODEL, "timestamp_granularity": "word", "part_seconds": PART_SECONDS,
+                           "language": language, "context_bias_terms": len(bias),
+                           "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
     lines = group_lines(words)
     if not lines:
         raise ValueError("錄音裡沒有辨識出任何文字")

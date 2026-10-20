@@ -118,7 +118,7 @@ streamlit run app.py
 - 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
 
 研究用量測（課程資料夾裡，每 5 秒寫檔一次，寫不進去也不影響錄音）：
-- `設定.json`：這堂課的程式版本（git commit）、模型、語言、卡死偵測門檻、重連與翻譯重試規則、斷句參數、`t_seconds` 的起點時間。研究期間改了設定也查得出每堂課用哪一組
+- `設定.json`：這堂課的程式版本（git commit）、模型、語言、卡死偵測門檻、重連與翻譯重試規則、斷句參數、健康指標每個欄位的統計視窗、`t_seconds` 的起點時間；課後重新辨識時也會把用的模型記進來。研究期間改了設定也查得出每堂課用哪一組
 - `字幕時效.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
 - `健康指標.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
 - `翻譯時效.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `字幕時效.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
@@ -173,7 +173,7 @@ streamlit run app.py
 |---|---|
 | Recognition delay（辨識延遲） | 越短字幕越快出現，越長通常越準。預設由伺服器決定 |
 | Minimum characters per translated segment（每段至少幾個字元才翻譯） | 越大 → 翻譯次數越少、每段越長；越小 → 翻譯更即時但請求更多 |
-| Translation model／Notes model | 預設 `mistral-small-latest`／`mistral-medium-latest`，可以改成其他 Mistral 模型名稱 |
+| Translation model／Notes model | 預設 `mistral-small-2603`（固定版本）／`mistral-medium-latest`，可以改成其他 Mistral 模型名稱 |
 
 ---
 
