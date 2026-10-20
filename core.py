@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import queue as thread_queue
@@ -343,6 +344,33 @@ class SessionConfig:
     save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
+CONN_LOG = "連線紀錄.csv"                  # 每堂課一份（在課程資料夾裡）
+CONN_LOG_ALL = "連線紀錄_全部.csv"         # 所有課程一份總表（在 records/ 裡）
+CONN_LOG_FIELDS = ["time", "course", "class_folder", "event", "category", "attempt",
+                   "downtime_seconds", "detail"]
+
+
+def classify_problem(msg: str) -> str:
+    """把錯誤訊息歸類成看得懂的原因，方便之後統計是哪一種問題最多。"""
+    m = msg.lower()
+    for key, label in (("toomanyrequests", "server busy (TooManyRequests)"),
+                       ("queueoverflow", "server busy (QueueOverflow)"),
+                       ("enginedead", "server crash (EngineDead)"),
+                       ("1012", "server restart (1012)"),
+                       ("service restart", "server restart (1012)"),
+                       ("internal error", "server internal error"),
+                       ("timeout", "server timeout"),
+                       ("no text for", "silent stall (no text while speaking)"),
+                       ("microphone", "microphone"),
+                       ("device", "microphone")):
+        if key in m:
+            return label
+    if any(k in m for k in ("connect", "network", "socket", "closed", "unreachable", "name resolution",
+                            "dns", "ssl", "eof", "reset by peer")):
+        return "network / connection closed"
+    return "other"
+
+
 class LiveSession:
     def __init__(self, cfg: SessionConfig, client_factory: Optional[Callable] = None):
         self.cfg = cfg
@@ -368,6 +396,9 @@ class LiveSession:
         self._audio_file = None
         self._caffeinate: Optional[subprocess.Popen] = None
         self._producer: Optional[threading.Thread] = None
+        self._down_since: Optional[float] = None    # 斷線開始的時間（字幕恢復時算斷了多久）
+        self._drops = 0
+        self._downtime = 0.0
         self._last_text_at = time.monotonic()      # 最後一次收到辨識文字的時間（卡死偵測用）
         self._loud_since_text = 0                   # 那之後收到幾格明顯的說話聲
         self.levels: deque[float] = deque(maxlen=20)   # 最近 2 秒的音量（每 100 毫秒一格，0–1），畫音量表用
@@ -393,6 +424,7 @@ class LiveSession:
             except Exception as e:
                 self._log_error(f"Could not create the audio file; saving the transcript only: {e}")
         self._keep_awake()
+        self._log_conn("start", detail=f"model={self.cfg.stt_model} language={self.cfg.language}")
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -437,6 +469,41 @@ class LiveSession:
         with self.lock:
             self.errors.append(f"{datetime.now():%H:%M:%S} {msg}")
 
+    def _log_conn(self, event: str, category: str = "", attempt: Optional[int] = None,
+                  downtime: Optional[float] = None, detail: str = ""):
+        """寫一筆連線紀錄到這堂課的 連線紀錄.csv 和 records/連線紀錄_全部.csv（寫不進去也不影響錄音）。"""
+        row = {"time": datetime.now().isoformat(timespec="seconds"), "course": self.cfg.course,
+               "class_folder": self.cfg.out_dir.name, "event": event, "category": category,
+               "attempt": "" if attempt is None else attempt,
+               "downtime_seconds": "" if downtime is None else round(downtime, 1),
+               "detail": re.sub(r"\s+", " ", detail)[:300]}
+        for path in (self.cfg.out_dir / CONN_LOG, self.cfg.out_dir.parent / CONN_LOG_ALL):
+            try:
+                with self.lock:
+                    new = not path.exists()
+                    with open(path, "a", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=CONN_LOG_FIELDS)
+                        if new:
+                            w.writeheader()
+                        w.writerow(row)
+            except OSError:
+                pass
+
+    def _went_down(self, msg: str, attempt: int):
+        """斷線或卡死：記一筆，並開始計算斷了多久。"""
+        if self._down_since is None:
+            self._down_since = time.monotonic()
+            self._drops += 1
+        self._log_conn("lost", classify_problem(msg), attempt, detail=msg)
+
+    def _came_back(self):
+        """又收到文字（或麥克風恢復）：記一筆恢復，附上斷了多久。"""
+        if self._down_since is not None:
+            down = time.monotonic() - self._down_since
+            self._downtime += down
+            self._down_since = None
+            self._log_conn("recovered", downtime=down)
+
     def _make_client(self):
         if self._client_factory:
             return self._client_factory(self.cfg.api_key)
@@ -459,6 +526,11 @@ class LiveSession:
             self.running = False
             self.ended_at = time.time()
             self._set_status("Stopped")
+            if self._down_since is not None:            # 結束時還沒恢復的那次也算進去
+                self._downtime += time.monotonic() - self._down_since
+                self._down_since = None
+            self._log_conn("end", downtime=self._downtime,
+                           detail=f"duration={self.elapsed():.0f}s drops={self._drops} segments={len(self.segments)}")
 
     async def _main(self):
         client = self._make_client()
@@ -556,6 +628,7 @@ class LiveSession:
                         last_data = time.monotonic()
                         if failures:
                             self._log_error("Microphone reconnected")
+                            self._came_back()
                             self._set_status("Recording")
                             failures = 0
             except Exception as e:
@@ -563,6 +636,7 @@ class LiveSession:
                     break
                 failures += 1
                 self._log_error(f"Microphone problem (attempt {failures}): {e}")
+                self._went_down(f"microphone: {e}", failures)
                 self._set_status("Microphone disconnected — reconnecting…")
                 if device is not None and failures >= 3:
                     self._log_error("Switching to the system default microphone")
@@ -615,6 +689,7 @@ class LiveSession:
             async for ev in stream:
                 if isinstance(ev, TranscriptionStreamTextDelta):
                     failures = 0
+                    self._came_back()
                     self._last_text_at = time.monotonic()
                     self._loud_since_text = 0
                     if not self._stop.is_set():
@@ -665,6 +740,7 @@ class LiveSession:
                 # 沒按停止就一直重連（例如教室 Wi-Fi 斷了一陣子）；斷線期間的音訊會排隊，連上後一起補送
                 failures += 1
                 self._log_error(f"Connection lost (attempt {failures}): {e}")
+                self._went_down(str(e), failures)
                 self._set_status(f"Connection lost — reconnecting (attempt {failures})…")
                 for _ in range(min(2 * failures, 10) * 5):
                     if self._stop.is_set():

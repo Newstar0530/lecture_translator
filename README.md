@@ -101,6 +101,14 @@ streamlit run app.py
 
 ---
 
+## 連線紀錄
+
+每次斷線、恢復都會自動記下來，方便看出問題出在哪：
+- 每堂課一份：課程資料夾裡的 `連線紀錄.csv`
+- 所有課程一份總表：`records/連線紀錄_全部.csv`（可以用 Excel / Numbers 打開）
+- 欄位：時間、課程、事件（start / lost / recovered / end）、原因分類（server busy、server crash、server restart、silent stall、network、microphone…）、第幾次重試、斷了幾秒才恢復字幕
+- 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
+
 ## 下課後從錄音檔重新辨識
 
 即時字幕斷掉、卡住，或聽錯很多時，下課後打開主畫面最下面的「📂 Earlier classes」，選那堂課，按 **🎙 Re-transcribe from recording**：

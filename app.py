@@ -20,7 +20,8 @@ import streamlit as st
 import flashcards
 import notion_sync
 import retranscribe
-from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL, SLIDES_MAX_PARTS,
+from core import (CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
+                  SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
                   fmt_time, generate_notes, list_input_devices, merge_terms, split_slide_text)
 
@@ -642,6 +643,23 @@ if ss.notes:
         st.markdown(re.sub(r"\*\*([^*\n]+?)\*\*", r"<strong>\1</strong>", ss.notes), unsafe_allow_html=True)
 
 # 之前的課：從錄音檔重新辨識（即時辨識斷掉、卡住時可以救回來），或用存好的逐字稿產生筆記
+def conn_summary(path: Path) -> str:
+    """讀連線紀錄，整理成一句話：斷了幾次、各是什麼原因、總共多久沒有字幕。"""
+    import csv
+    from collections import Counter
+    try:
+        rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    except OSError:
+        return ""
+    drops = [r for r in rows if r["event"] == "lost" and r["attempt"] == "1"]
+    if not drops:
+        return "No connection drops recorded"
+    reasons = Counter(r["category"] for r in drops).most_common()
+    down = sum(float(r["downtime_seconds"] or 0) for r in rows if r["event"] == "recovered")
+    return (f"{len(drops)} drop(s): " + ", ".join(f"{c} ×{n}" for c, n in reasons)
+            + f" · about {down / 60:.1f} min without subtitles")
+
+
 def _has(d: Path, name: str) -> bool:
     return (d / name).exists() and (d / name).stat().st_size > 0
 
@@ -664,6 +682,11 @@ if saved:
         info = load_slides_info(pick)
         slide_terms, fixed = info.get("terms", {}), load_fixed_terms(course_name)
         background = fix_brief(info.get("summary", ""), slide_terms, fixed)
+        if (pick / CONN_LOG).exists():
+            st.caption(f"📶 Connection: {conn_summary(pick / CONN_LOG)}")
+        if (RECORDS_DIR / CONN_LOG_ALL).exists():
+            st.caption(f"📊 All classes: {conn_summary(RECORDS_DIR / CONN_LOG_ALL)} "
+                       f"(details in records/{CONN_LOG_ALL})")
         st.caption(f"Uses the Lecture language selected in the sidebar ({language}). "
                    "Re-transcribing keeps the live transcript and saves a separate full one, then makes the notes.")
         r1, r2 = st.columns(2)
