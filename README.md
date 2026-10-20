@@ -107,7 +107,14 @@ streamlit run app.py
 - 每堂課一份：課程資料夾裡的 `連線紀錄.csv`
 - 所有課程一份總表：`records/連線紀錄_全部.csv`（可以用 Excel / Numbers 打開）
 - 欄位：時間、課程、事件（start / lost / recovered / end）、原因分類（server busy、server crash、server restart、silent stall、network、microphone…）、第幾次重試、斷了幾秒才恢復字幕
+- lost / recovered 的 detail 開頭有 `since_last_text_seconds=…`：當時已經多久沒收到字幕。斷了幾秒只從「發現斷線」起算，這個才是使用者實際沒字幕的時間（例如 silent stall ≈ 30 秒偵測＋重連）
+- 斷線中還會多兩種事件，把一次中斷拆成「偵測 → 等待 → 連線 → 第一筆字幕」：`reconnect_start`（開始建立新連線，`since_lost_seconds` = 宣告斷線後等了多久）、`session_created`（伺服器確認連上，`connect_seconds` = 建立連線花多久）。之後的 `recovered` 就是第一筆字幕出現的時間
 - 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
+
+研究用量測（課程資料夾裡，每 5 秒寫檔一次，寫不進去也不影響錄音）：
+- `字幕時效.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
+- `健康指標.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
+- `翻譯時效.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `字幕時效.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
 
 ## 下課後從錄音檔重新辨識
 

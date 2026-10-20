@@ -349,6 +349,43 @@ CONN_LOG_ALL = "連線紀錄_全部.csv"         # 所有課程一份總表（�
 CONN_LOG_FIELDS = ["time", "course", "class_folder", "event", "category", "attempt",
                    "downtime_seconds", "detail"]
 
+# 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 錄音.flac 做 trace-driven 模擬）
+LATENCY_LOG = "字幕時效.csv"               # 每收到一段辨識文字記一筆
+LATENCY_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "audio_sent_seconds", "audio_captured_seconds",
+                      "backlog_seconds", "chars", "text"]
+TRANSLATION_LOG = "翻譯時效.csv"           # 每句話翻譯完（或放棄）記一筆
+TRANSLATION_LOG_FIELDS = ["wall_time", "idx", "segment_t_seconds", "start_t_seconds", "done_t_seconds",
+                          "queue_seconds", "translate_seconds", "total_seconds", "attempts", "ok",
+                          "audio_sent_seconds", "chars", "error"]
+HEALTH_LOG = "健康指標.csv"                # 每秒記一筆
+HEALTH_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "loud_chunks", "chunks", "text_chars",
+                     "since_last_text_seconds", "down", "audio_sent_seconds", "backlog_seconds"]
+
+
+class _CsvBuffer:
+    """先放在記憶體，每幾秒整批寫進 CSV（寫不進去就丟掉，不影響錄音）。"""
+
+    def __init__(self, path: Path, fields: list[str]):
+        self.path, self.fields = path, fields
+        self.rows: list[dict] = []
+
+    def add(self, row: dict):
+        self.rows.append(row)
+
+    def flush(self):
+        rows, self.rows = self.rows, []
+        if not rows:
+            return
+        try:
+            new = not self.path.exists()
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self.fields)
+                if new:
+                    w.writeheader()
+                w.writerows(rows)
+        except OSError:
+            pass
+
 
 def classify_problem(msg: str) -> str:
     """把錯誤訊息歸類成看得懂的原因，方便之後統計是哪一種問題最多。"""
@@ -397,10 +434,22 @@ class LiveSession:
         self._caffeinate: Optional[subprocess.Popen] = None
         self._producer: Optional[threading.Thread] = None
         self._down_since: Optional[float] = None    # 斷線開始的時間（字幕恢復時算斷了多久）
+        self._connect_started_at: Optional[float] = None   # 這條連線開始建立的時間（研究用量測）
         self._drops = 0
         self._downtime = 0.0
         self._last_text_at = time.monotonic()      # 最後一次收到辨識文字的時間（卡死偵測用）
         self._loud_since_text = 0                   # 那之後收到幾格明顯的說話聲
+        # 研究用量測：_last_text_real 不會因為重連而重設（卡死偵測用的 _last_text_at 會）
+        self._last_text_real = time.monotonic()
+        self._t0 = time.monotonic()
+        self.audio_captured_seconds = 0.0          # 收到的音訊（= 錄音.flac 裡的位置）
+        self._conn_id = 0
+        self._sec_chunks = self._sec_loud = self._sec_chars = 0   # 這一秒的累計（每秒歸零）
+        self._meter_lock = threading.Lock()         # 收音執行緒和健康紀錄同時改計數用
+        self._latency_log = _CsvBuffer(cfg.out_dir / LATENCY_LOG, LATENCY_LOG_FIELDS)
+        self._health_log = _CsvBuffer(cfg.out_dir / HEALTH_LOG, HEALTH_LOG_FIELDS)
+        self._translation_log = _CsvBuffer(cfg.out_dir / TRANSLATION_LOG, TRANSLATION_LOG_FIELDS)
+        self._seg_formed_at: dict[int, float] = {}   # 句子斷好（送去翻譯）的時間，算翻譯延遲用
         self.levels: deque[float] = deque(maxlen=20)   # 最近 2 秒的音量（每 100 毫秒一格，0–1），畫音量表用
         self._written_upto = 0
         self.terms = TermBook(cfg.fixed_terms, cfg.slide_terms)
@@ -412,6 +461,7 @@ class LiveSession:
         self.running = True
         self._stop.clear()
         self.started_at = time.time()
+        self._t0 = self._last_text_real = time.monotonic()
         with open(self.transcript_path, "w", encoding="utf-8") as f:
             title = self.cfg.course or "上課逐字稿"
             f.write(f"# {title}\n\n錄音開始：{datetime.now():%Y-%m-%d %H:%M}\n\n")
@@ -494,7 +544,9 @@ class LiveSession:
         if self._down_since is None:
             self._down_since = time.monotonic()
             self._drops += 1
-        self._log_conn("lost", classify_problem(msg), attempt, detail=msg)
+        # downtime_seconds 只從宣告斷線起算；這裡記下偵測時已經多久沒字幕（例如 silent stall ≈ 30 秒）
+        since = time.monotonic() - self._last_text_real
+        self._log_conn("lost", classify_problem(msg), attempt, detail=f"since_last_text_seconds={since:.1f} {msg}")
 
     def _came_back(self):
         """又收到文字（或麥克風恢復）：記一筆恢復，附上斷了多久。"""
@@ -502,7 +554,24 @@ class LiveSession:
             down = time.monotonic() - self._down_since
             self._downtime += down
             self._down_since = None
-            self._log_conn("recovered", downtime=down)
+            gap = time.monotonic() - self._last_text_real
+            self._log_conn("recovered", downtime=down, detail=f"since_last_text_seconds={gap:.1f}")
+
+    def _reconnect_started(self, attempt: int):
+        """斷線中開始建立新連線：記一筆，附上從宣告斷線起過了多久（含退避等待）。"""
+        self._connect_started_at = time.monotonic()
+        if self._down_since is not None:
+            waited = self._connect_started_at - self._down_since
+            self._log_conn("reconnect_start", attempt=attempt, detail=f"since_lost_seconds={waited:.1f}")
+
+    def _session_created(self):
+        """伺服器確認新連線建立：記一筆，把「連上」和「第一筆字幕出現（recovered）」分開。"""
+        if self._down_since is not None and self._connect_started_at is not None:
+            now = time.monotonic()
+            self._log_conn("session_created",
+                           detail=f"since_lost_seconds={now - self._down_since:.1f} "
+                                  f"connect_seconds={now - self._connect_started_at:.1f}")
+        self._connect_started_at = None
 
     def _make_client(self):
         if self._client_factory:
@@ -540,6 +609,7 @@ class LiveSession:
         translator = asyncio.create_task(self._translator(client))
         idle = asyncio.create_task(self._idle_flusher())
         stt = asyncio.create_task(self._stt_loop(client))
+        health = asyncio.create_task(self._health_logger())
         stop_seen: Optional[float] = None
         try:
             # 按下停止後，最多等 20 秒讓伺服器送回最後的辨識結果
@@ -556,6 +626,7 @@ class LiveSession:
                 pass
         finally:
             idle.cancel()
+            health.cancel()
             rest = self._buffer.flush()
             if rest:
                 self._add_segment(rest)
@@ -564,6 +635,9 @@ class LiveSession:
             self._write_pending()
             # 等收音執行緒把最後的音訊寫進錄音檔、關檔
             await asyncio.get_running_loop().run_in_executor(None, producer.join, 10)
+            self._latency_log.flush()
+            self._health_log.flush()
+            self._translation_log.flush()
 
     # 音訊：麥克風或檔案 → 錄音檔 ＋ thread queue
     # 錄音檔在這裡寫，所以網路斷掉、還沒送去辨識的音訊也會先存進錄音檔
@@ -596,7 +670,12 @@ class LiveSession:
         db = 20 * np.log10(max(rms, 1.0) / 32768)
         level = min(max((db + 60) / 50, 0.0), 1.0)
         self.levels.append(level)
-        if level >= self.LOUD_LEVEL:
+        loud = level >= self.LOUD_LEVEL
+        with self._meter_lock:
+            self.audio_captured_seconds += len(chunk) / 2 / SAMPLE_RATE
+            self._sec_chunks += 1
+            self._sec_loud += loud
+        if loud:
             self._loud_since_text += 1
 
     def _mic_loop(self):
@@ -690,6 +769,7 @@ class LiveSession:
                 if isinstance(ev, TranscriptionStreamTextDelta):
                     failures = 0
                     self._came_back()
+                    self._record_text(ev.text)
                     self._last_text_at = time.monotonic()
                     self._loud_since_text = 0
                     if not self._stop.is_set():
@@ -709,6 +789,8 @@ class LiveSession:
                     msg = ev.error.message
                     raise ConnectionError(f"speech recognition server error: {getattr(msg, 'detail', msg)}")
                 elif getattr(ev, "type", None) in ("session.created", "session.updated"):
+                    if ev.type == "session.created":
+                        self._session_created()
                     if not self._stop.is_set():
                         self._set_status("Recording")
 
@@ -720,6 +802,8 @@ class LiveSession:
                     kwargs["target_streaming_delay_ms"] = self.cfg.target_delay_ms
                 self._last_text_at = time.monotonic()
                 self._loud_since_text = 0
+                self._conn_id += 1
+                self._reconnect_started(failures)
                 consumer = asyncio.create_task(consume(client.audio.realtime.transcribe_stream(**kwargs)))
                 # 一邊收結果，一邊每秒檢查有沒有卡死（連線沒斷、也沒報錯，但一直不回文字）
                 while not consumer.done():
@@ -750,6 +834,61 @@ class LiveSession:
                 return
             # 伺服器結束了這次連線但使用者沒按停止 → 自動重連
 
+    # ----- 研究用量測（字幕時效.csv、健康指標.csv）-----
+    def _record_text(self, text: str):
+        now = time.monotonic()
+        self._last_text_real = now
+        self._sec_chars += len(text)
+        self._latency_log.add({
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "t_seconds": round(now - self._t0, 3), "conn_id": self._conn_id,
+            "audio_sent_seconds": round(self.audio_seconds, 2),
+            "audio_captured_seconds": round(self.audio_captured_seconds, 2),
+            "backlog_seconds": round(self.audio_captured_seconds - self.audio_seconds, 2),
+            "chars": len(text), "text": text})
+
+    def _record_translation(self, seg: Segment, started: float, attempts: int):
+        """一句話翻譯完（或三次都失敗）：記下斷句時間、排隊多久、翻譯花多久、重試幾次。"""
+        now = time.monotonic()
+        formed = self._seg_formed_at.pop(seg.idx, started)
+        self._translation_log.add({
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"), "idx": seg.idx,
+            "segment_t_seconds": round(formed - self._t0, 3), "start_t_seconds": round(started - self._t0, 3),
+            "done_t_seconds": round(now - self._t0, 3), "queue_seconds": round(started - formed, 3),
+            "translate_seconds": round(now - started, 3), "total_seconds": round(now - formed, 3),
+            "attempts": attempts, "ok": int(not seg.error), "audio_sent_seconds": round(seg.elapsed, 2),
+            "chars": len(seg.source), "error": re.sub(r"\s+", " ", seg.error or "")[:200]})
+
+    async def _health_logger(self):
+        """每秒記一筆：這一秒有幾格明顯說話聲、收到幾個字、多久沒字幕、是不是斷線中；每 5 秒寫檔一次。"""
+        next_tick = time.monotonic() + 1
+        n = 0
+        try:
+            while True:
+                await asyncio.sleep(max(next_tick - time.monotonic(), 0))
+                next_tick += 1
+                now = time.monotonic()
+                with self._meter_lock:
+                    chunks, self._sec_chunks = self._sec_chunks, 0
+                    loud, self._sec_loud = self._sec_loud, 0
+                    captured = self.audio_captured_seconds
+                chars, self._sec_chars = self._sec_chars, 0
+                self._health_log.add({
+                    "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+                    "t_seconds": round(now - self._t0, 3), "conn_id": self._conn_id,
+                    "loud_chunks": loud, "chunks": chunks, "text_chars": chars,
+                    "since_last_text_seconds": round(now - self._last_text_real, 1),
+                    "down": int(self._down_since is not None),
+                    "audio_sent_seconds": round(self.audio_seconds, 2),
+                    "backlog_seconds": round(captured - self.audio_seconds, 2)})
+                n += 1
+                if n % 5 == 0:
+                    self._latency_log.flush()
+                    self._health_log.flush()
+                    self._translation_log.flush()
+        except asyncio.CancelledError:
+            pass
+
     async def _idle_flusher(self):
         while True:
             await asyncio.sleep(0.5)
@@ -762,6 +901,7 @@ class LiveSession:
         with self.lock:
             seg = Segment(idx=len(self.segments), elapsed=self.audio_seconds, source=text)
             self.segments.append(seg)
+            self._seg_formed_at[seg.idx] = time.monotonic()
         with open(self.source_path, "a", encoding="utf-8") as f:
             f.write(f"[{fmt_time(seg.elapsed)}] {text}\n")
         self._trans_q.put_nowait(seg)
@@ -773,7 +913,10 @@ class LiveSession:
                 return
             with self.lock:
                 context = " ".join(s.source for s in self.segments[max(0, seg.idx - 2):seg.idx])
+            started = time.monotonic()
+            attempts = 0
             for attempt in range(3):
+                attempts = attempt + 1
                 try:
                     glossary = self.terms.relevant(f"{context} {seg.source}")
                     brief = fix_brief(self.cfg.slide_brief, self.cfg.slide_terms, self.terms.fixed())
@@ -796,6 +939,7 @@ class LiveSession:
                         self._log_error(f"Translation failed: {e}")
                     else:
                         await asyncio.sleep(wait)
+            self._record_translation(seg, started, attempts)
             self._write_pending()
 
     @staticmethod
