@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import csv
 import io
 import re
 import time
@@ -25,8 +26,10 @@ CUT_SEARCH_SECONDS = 30       # 在每段結尾前 30 秒內找最安靜的地�
 LANG_CODES = {"English": "en", "French": "fr"}
 FULL_SOURCE = "逐字稿_原文_完整.txt"
 FULL_BILINGUAL = "逐字稿_雙語_完整.md"
+REFERENCE_TIMELINE = "參考時間軸.csv"   # 每個字在 錄音.flac 裡的開始、結束秒數（算有效字幕可用率的基準）
 
 Line = tuple[float, str]      # (開始秒數, 原文)
+Word = tuple[float, float, str]   # (開始秒數, 結束秒數, 文字；英文字前面通常帶空格)
 
 
 def split_audio(path: Path, part_seconds: int = PART_SECONDS) -> list[tuple[float, bytes]]:
@@ -56,10 +59,11 @@ def split_audio(path: Path, part_seconds: int = PART_SECONDS) -> list[tuple[floa
     return parts
 
 
-def _transcribe_part(client, data: bytes, language: str, bias: list[str]) -> list[tuple[float, str]]:
-    """辨識一段錄音，回傳 [(這段裡的秒數, 文字)]。失敗會重試；專有名詞提示被拒絕就拿掉再試。"""
+def _transcribe_part(client, data: bytes, language: str, bias: list[str]) -> list[Word]:
+    """辨識一段錄音，回傳每個字 [(開始秒數, 結束秒數, 文字)]（這段裡的秒數）。
+    失敗會重試；專有名詞提示被拒絕就拿掉再試。"""
     kw = {"model": BATCH_STT_MODEL, "file": {"file_name": "part.flac", "content": data},
-          "timestamp_granularities": ["segment"]}
+          "timestamp_granularities": ["word"]}
     if LANG_CODES.get(language):
         kw["language"] = LANG_CODES[language]
     if bias:
@@ -67,8 +71,9 @@ def _transcribe_part(client, data: bytes, language: str, bias: list[str]) -> lis
     for attempt in range(4):
         try:
             r = client.audio.transcriptions.complete(**kw)
-            return [(float(s.start or 0), s.text.strip()) for s in (r.segments or []) if s.text.strip()] \
-                or ([(0.0, r.text.strip())] if r.text.strip() else [])
+            words = [(float(s.start or 0), float(s.end or s.start or 0), s.text) for s in (r.segments or [])
+                     if s.text.strip()]
+            return words or ([(0.0, 0.0, r.text.strip())] if r.text.strip() else [])
         except Exception as e:
             msg = str(e)
             if "401" in msg or "403" in msg or attempt == 3:
@@ -80,24 +85,34 @@ def _transcribe_part(client, data: bytes, language: str, bias: list[str]) -> lis
     return []
 
 
-def group_lines(segments: list[tuple[float, str]]) -> list[Line]:
-    """把辨識出的小片段合成適合閱讀和翻譯的句子：到句尾且夠長、或太長、或中間停頓很久就換一行。"""
+def group_lines(words: list[Word]) -> list[Line]:
+    """把辨識出的字合成適合閱讀和翻譯的句子：到句尾且夠長、或太長、或中間停頓很久就換一行。"""
     lines: list[Line] = []
-    cur, cur_start, last_t = "", 0.0, 0.0
-    for t, text in segments:
-        if cur and t - last_t > 4 and len(cur) >= 40:     # 停頓超過 4 秒
+    cur, cur_start, last_end = "", 0.0, 0.0
+    for start, end, text in words:
+        if cur and start - last_end > 4 and len(cur) >= 40:     # 停頓超過 4 秒
             lines.append((cur_start, cur.strip()))
             cur = ""
         if not cur:
-            cur_start = t
-        cur = f"{cur} {text}" if cur else text
-        last_t = t
+            cur_start = start
+            text = text.lstrip()
+        # 英文字本身前面帶空格；沒帶空格的（例如分段開頭）補一個
+        cur = cur + text if (not cur or text[:1].isspace()) else f"{cur} {text}"
+        last_end = end
         if (len(cur) >= 90 and re.search(r"[.!?…]['\")\]]*$", cur)) or len(cur) >= 320:
             lines.append((cur_start, cur.strip()))
             cur = ""
     if cur.strip():
         lines.append((cur_start, cur.strip()))
     return lines
+
+
+def write_reference_timeline(path: Path, words: list[Word]):
+    """把每個字的時間存成 CSV：和即時字幕的 字幕時效.csv 對照，就能算每段話的字幕有沒有及時出現。"""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["start_seconds", "end_seconds", "text"])
+        w.writerows((round(a, 2), round(b, 2), t.strip()) for a, b, t in words)
 
 
 def _translate_line(client, lines: list[Line], i: int, glossary: dict[str, str], background: str,
@@ -139,17 +154,18 @@ def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "Engl
     say("Splitting the recording…")
     parts = split_audio(audio)
     say(f"Transcribing {len(parts)} part(s) of ~10 minutes…")
-    results: dict[int, list[tuple[float, str]]] = {}
+    results: dict[int, list[Word]] = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_transcribe_part, client, data, language, bias): i
                    for i, (_, data) in enumerate(parts)}
         for n, fut in enumerate(as_completed(futures), 1):
             i = futures[fut]
             offset = parts[i][0]
-            results[i] = [(offset + t, text) for t, text in fut.result()]
+            results[i] = [(offset + a, offset + b, text) for a, b, text in fut.result()]
             say(f"Transcribed {n}/{len(parts)}")
-    segments = [seg for i in sorted(results) for seg in results[i]]
-    lines = group_lines(segments)
+    words = [w for i in sorted(results) for w in results[i]]
+    write_reference_timeline(out_dir / REFERENCE_TIMELINE, words)
+    lines = group_lines(words)
     if not lines:
         raise ValueError("錄音裡沒有辨識出任何文字")
 

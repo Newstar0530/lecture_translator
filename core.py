@@ -346,8 +346,10 @@ class SessionConfig:
 
 CONN_LOG = "連線紀錄.csv"                  # 每堂課一份（在課程資料夾裡）
 CONN_LOG_ALL = "連線紀錄_全部.csv"         # 所有課程一份總表（在 records/ 裡）
-CONN_LOG_FIELDS = ["time", "course", "class_folder", "event", "category", "attempt",
+CONN_LOG_FIELDS = ["time", "t_seconds", "code_version", "course", "class_folder", "conn_id", "event", "category",
+                   "error_type", "attempt", "since_last_text_seconds", "since_lost_seconds", "connect_seconds",
                    "downtime_seconds", "detail"]
+CONFIG_FILE = "設定.json"                  # 每堂課一份：程式版本與所有門檻、模型設定（之後比較不同課堂用）
 
 # 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 錄音.flac 做 trace-driven 模擬）
 LATENCY_LOG = "字幕時效.csv"               # 每收到一段辨識文字記一筆
@@ -377,14 +379,58 @@ class _CsvBuffer:
         if not rows:
             return
         try:
-            new = not self.path.exists()
-            with open(self.path, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=self.fields)
-                if new:
-                    w.writeheader()
-                w.writerows(rows)
+            append_csv(self.path, self.fields, rows)
         except OSError:
             pass
+
+
+def append_csv(path: Path, fields: list[str], rows: list[dict]):
+    """把幾筆資料接到 CSV 後面。舊檔的欄位跟現在不一樣，就把舊檔改名保留、開新檔，不會混在一起。"""
+    new = not path.exists()
+    if not new:
+        with open(path, newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), [])
+        if header != fields:
+            path.rename(path.with_name(f"{path.stem}_舊格式_{datetime.now():%Y%m%d-%H%M%S}{path.suffix}"))
+            new = True
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if new:
+            w.writeheader()
+        w.writerows(rows)
+
+
+class SilentStall(ConnectionError):
+    """連線沒斷也沒報錯，但講話時一直沒有文字回來。"""
+
+
+class ServerErrorEvent(ConnectionError):
+    """伺服器在串流裡送來錯誤事件（附錯誤代碼）。"""
+
+    def __init__(self, message: str, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def error_type(e: BaseException) -> str:
+    """錯誤的類別名稱＋代碼（例如 ServerErrorEvent:3001、ConnectionClosedError:1012），統計故障原因用。"""
+    code = (getattr(e, "code", None) or getattr(e, "status_code", None)
+            or getattr(getattr(e, "rcvd", None), "code", None))
+    name = type(e).__name__
+    return f"{name}:{str(code)[:40]}" if code not in (None, "") else name
+
+
+def code_version() -> str:
+    """目前程式的 git commit（有沒 commit 的修改會加上 -dirty）；查不到就回 unknown。"""
+    here = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True,
+                                text=True, timeout=3).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=here,
+                               capture_output=True, text=True, timeout=3).stdout.strip()
+        return (commit + ("-dirty" if dirty else "")) if commit else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def classify_problem(msg: str) -> str:
@@ -435,6 +481,7 @@ class LiveSession:
         self._producer: Optional[threading.Thread] = None
         self._down_since: Optional[float] = None    # 斷線開始的時間（字幕恢復時算斷了多久）
         self._connect_started_at: Optional[float] = None   # 這條連線開始建立的時間（研究用量測）
+        self._code_version = "unknown"
         self._drops = 0
         self._downtime = 0.0
         self._last_text_at = time.monotonic()      # 最後一次收到辨識文字的時間（卡死偵測用）
@@ -474,7 +521,10 @@ class LiveSession:
             except Exception as e:
                 self._log_error(f"Could not create the audio file; saving the transcript only: {e}")
         self._keep_awake()
-        self._log_conn("start", detail=f"model={self.cfg.stt_model} language={self.cfg.language}")
+        self._code_version = code_version()
+        self._write_config()
+        self._log_conn("start", detail=f"model={self.cfg.stt_model} language={self.cfg.language} "
+                                       f"stall_seconds={self.STALL_SECONDS}")
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -520,58 +570,96 @@ class LiveSession:
             self.errors.append(f"{datetime.now():%H:%M:%S} {msg}")
 
     def _log_conn(self, event: str, category: str = "", attempt: Optional[int] = None,
-                  downtime: Optional[float] = None, detail: str = ""):
-        """寫一筆連線紀錄到這堂課的 連線紀錄.csv 和 records/連線紀錄_全部.csv（寫不進去也不影響錄音）。"""
-        row = {"time": datetime.now().isoformat(timespec="seconds"), "course": self.cfg.course,
-               "class_folder": self.cfg.out_dir.name, "event": event, "category": category,
+                  downtime: Optional[float] = None, detail: str = "", error: str = "",
+                  since_last_text: Optional[float] = None, since_lost: Optional[float] = None,
+                  connect: Optional[float] = None):
+        """寫一筆連線紀錄到這堂課的 連線紀錄.csv 和 records/連線紀錄_全部.csv（寫不進去也不影響錄音）。
+        t_seconds 和其他研究用 CSV 用同一個起點，可以直接對齊；秒數欄位都用 monotonic 時鐘算。"""
+        def sec(x):
+            return "" if x is None else round(x, 3)
+        row = {"time": datetime.now().isoformat(timespec="milliseconds"),
+               "t_seconds": round(time.monotonic() - self._t0, 3), "code_version": self._code_version,
+               "course": self.cfg.course, "class_folder": self.cfg.out_dir.name, "conn_id": self._conn_id,
+               "event": event, "category": category, "error_type": error,
                "attempt": "" if attempt is None else attempt,
-               "downtime_seconds": "" if downtime is None else round(downtime, 1),
-               "detail": re.sub(r"\s+", " ", detail)[:300]}
+               "since_last_text_seconds": sec(since_last_text), "since_lost_seconds": sec(since_lost),
+               "connect_seconds": sec(connect), "downtime_seconds": sec(downtime),
+               "detail": re.sub(r"\s+", " ", detail)[:500]}
         for path in (self.cfg.out_dir / CONN_LOG, self.cfg.out_dir.parent / CONN_LOG_ALL):
             try:
                 with self.lock:
-                    new = not path.exists()
-                    with open(path, "a", newline="", encoding="utf-8") as f:
-                        w = csv.DictWriter(f, fieldnames=CONN_LOG_FIELDS)
-                        if new:
-                            w.writeheader()
-                        w.writerow(row)
+                    append_csv(path, CONN_LOG_FIELDS, [row])
             except OSError:
                 pass
 
-    def _went_down(self, msg: str, attempt: int):
+    def _went_down(self, msg: str, attempt: int, err: str = ""):
         """斷線或卡死：記一筆，並開始計算斷了多久。"""
         if self._down_since is None:
             self._down_since = time.monotonic()
             self._drops += 1
-        # downtime_seconds 只從宣告斷線起算；這裡記下偵測時已經多久沒字幕（例如 silent stall ≈ 30 秒）
-        since = time.monotonic() - self._last_text_real
-        self._log_conn("lost", classify_problem(msg), attempt, detail=f"since_last_text_seconds={since:.1f} {msg}")
+        # downtime_seconds 只從宣告斷線起算；since_last_text 是偵測時已經多久沒字幕（例如 silent stall ≈ 30 秒）
+        self._log_conn("lost", classify_problem(f"{err} {msg}"), attempt, detail=msg, error=err,
+                       since_last_text=time.monotonic() - self._last_text_real)
 
     def _came_back(self):
         """又收到文字（或麥克風恢復）：記一筆恢復，附上斷了多久。"""
         if self._down_since is not None:
-            down = time.monotonic() - self._down_since
+            now = time.monotonic()
+            down = now - self._down_since
             self._downtime += down
             self._down_since = None
-            gap = time.monotonic() - self._last_text_real
-            self._log_conn("recovered", downtime=down, detail=f"since_last_text_seconds={gap:.1f}")
+            self._log_conn("recovered", downtime=down, since_lost=down,
+                           since_last_text=now - self._last_text_real)
 
     def _reconnect_started(self, attempt: int):
         """斷線中開始建立新連線：記一筆，附上從宣告斷線起過了多久（含退避等待）。"""
         self._connect_started_at = time.monotonic()
         if self._down_since is not None:
-            waited = self._connect_started_at - self._down_since
-            self._log_conn("reconnect_start", attempt=attempt, detail=f"since_lost_seconds={waited:.1f}")
+            self._log_conn("reconnect_start", attempt=attempt,
+                           since_lost=self._connect_started_at - self._down_since)
 
     def _session_created(self):
         """伺服器確認新連線建立：記一筆，把「連上」和「第一筆字幕出現（recovered）」分開。"""
         if self._down_since is not None and self._connect_started_at is not None:
             now = time.monotonic()
-            self._log_conn("session_created",
-                           detail=f"since_lost_seconds={now - self._down_since:.1f} "
-                                  f"connect_seconds={now - self._connect_started_at:.1f}")
+            self._log_conn("session_created", since_lost=now - self._down_since,
+                           connect=now - self._connect_started_at)
         self._connect_started_at = None
+
+    def _write_config(self):
+        """把這堂課用的程式版本、模型、所有門檻存成 設定.json，之後比較不同課堂時知道條件是否一樣。"""
+        try:
+            from importlib.metadata import version
+            sdk = version("mistralai")
+        except Exception:
+            sdk = "unknown"
+        b = self._buffer
+        cfg = {k: v for k, v in vars(self.cfg).items()
+               if k not in ("api_key", "out_dir", "fixed_terms", "slide_terms", "slide_brief")}
+        data = {
+            "code_version": self._code_version,
+            "started_at": datetime.fromtimestamp(self.started_at).isoformat(timespec="milliseconds"),
+            "t_seconds_origin": "t_seconds = 0 at started_at (monotonic clock)",
+            "python": sys.version.split()[0], "mistralai_sdk": sdk, "platform": sys.platform,
+            "session_config": cfg,
+            "glossary": {"fixed_terms": len(self.cfg.fixed_terms), "slide_terms": len(self.cfg.slide_terms),
+                         "slide_brief_chars": len(self.cfg.slide_brief)},
+            "audio": {"sample_rate": SAMPLE_RATE, "chunk_ms": CHUNK_MS},
+            "stall_detection": {"stall_seconds": self.STALL_SECONDS, "loud_chunks": self.STALL_LOUD_CHUNKS,
+                                "loud_level": self.LOUD_LEVEL},
+            "reconnect_backoff": "wait min(2 * failures, 10) s after each failed STT connection",
+            "microphone_reconnect": "no audio for 3 s -> reopen; wait min(failures, 5) s; "
+                                    "fall back to default device after 3 failures",
+            "sentence_buffer": {"min_chars": b.min_chars, "max_chars": b.max_chars,
+                                "idle_seconds": b.idle_seconds, "comma_seconds": b.comma_seconds,
+                                "comma_chars": b.comma_chars},
+            "translation_retry": "3 attempts; wait 5*(n) s on 429, else 1.5*(n) s",
+        }
+        try:
+            (self.cfg.out_dir / CONFIG_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                                                        encoding="utf-8")
+        except OSError:
+            pass
 
     def _make_client(self):
         if self._client_factory:
@@ -715,7 +803,7 @@ class LiveSession:
                     break
                 failures += 1
                 self._log_error(f"Microphone problem (attempt {failures}): {e}")
-                self._went_down(f"microphone: {e}", failures)
+                self._went_down(f"microphone: {e}", failures, error_type(e))
                 self._set_status("Microphone disconnected — reconnecting…")
                 if device is not None and failures >= 3:
                     self._log_error("Switching to the system default microphone")
@@ -787,7 +875,8 @@ class LiveSession:
                     # 伺服器那邊出錯（例如逾時、辨識引擎當掉）：這條連線通常已經壞了，
                     # 直接斷開重連，不要一直等；還沒送出的音訊會在重連後補送
                     msg = ev.error.message
-                    raise ConnectionError(f"speech recognition server error: {getattr(msg, 'detail', msg)}")
+                    raise ServerErrorEvent(f"speech recognition server error: {getattr(msg, 'detail', msg)}",
+                                           code=getattr(ev.error, "code", None))
                 elif getattr(ev, "type", None) in ("session.created", "session.updated"):
                     if ev.type == "session.created":
                         self._session_created()
@@ -817,14 +906,14 @@ class LiveSession:
                             await consumer
                         except (asyncio.CancelledError, Exception):
                             pass
-                        raise ConnectionError(f"no text for {self.STALL_SECONDS}s although the microphone "
+                        raise SilentStall(f"no text for {self.STALL_SECONDS}s although the microphone "
                                               "hears speech — restarting the connection")
                 await consumer          # 把 consume 裡的錯誤丟出來
             except Exception as e:
                 # 沒按停止就一直重連（例如教室 Wi-Fi 斷了一陣子）；斷線期間的音訊會排隊，連上後一起補送
                 failures += 1
                 self._log_error(f"Connection lost (attempt {failures}): {e}")
-                self._went_down(str(e), failures)
+                self._went_down(str(e), failures, error_type(e))
                 self._set_status(f"Connection lost — reconnecting (attempt {failures})…")
                 for _ in range(min(2 * failures, 10) * 5):
                     if self._stop.is_set():
