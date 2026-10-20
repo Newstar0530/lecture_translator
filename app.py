@@ -19,6 +19,7 @@ import streamlit as st
 
 import flashcards
 import notion_sync
+import retranscribe
 from core import (DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL, SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
                   fmt_time, generate_notes, list_input_devices, merge_terms, split_slide_text)
@@ -494,8 +495,10 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
             ss.notes, ss.notes_path = notes, path
             ss.notes_meta, ss.notion_url = (course, date_str), None
             box.update(label="Notes ready — see below the subtitles", state="complete", expanded=False)
+            return True
         except Exception as e:
             box.update(label=f"Generating notes failed: {e} (finished parts are saved; click again to resume)", state="error")
+            return False
 
 
 if note_clicked:
@@ -638,27 +641,64 @@ if ss.notes:
         # 粗體緊貼中文標點時 Markdown 不會解析（會看到 **），顯示時直接換成 HTML 粗體
         st.markdown(re.sub(r"\*\*([^*\n]+?)\*\*", r"<strong>\1</strong>", ss.notes), unsafe_allow_html=True)
 
-# 程式當掉、關掉後，也能用 records/ 裡存好的逐字稿產生筆記
+# 之前的課：從錄音檔重新辨識（即時辨識斷掉、卡住時可以救回來），或用存好的逐字稿產生筆記
+def _has(d: Path, name: str) -> bool:
+    return (d / name).exists() and (d / name).stat().st_size > 0
+
+
 saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
-                and (d / "逐字稿_原文.txt").exists() and (d / "逐字稿_原文.txt").stat().st_size > 0),
+                and (_has(d, "逐字稿_原文.txt") or _has(d, "錄音.flac"))),
                reverse=True) if RECORDS_DIR.exists() else []
 if saved:
     st.divider()
-    with st.expander("📂 Generate notes from an earlier transcript"):
-        pick = st.selectbox("Class", saved,
-                            format_func=lambda d: d.name + (" (has notes)" if (d / "筆記.md").exists() else ""))
-        if st.button("Generate notes", disabled=running and sess.cfg.out_dir == pick):
-            if not api_key:
-                st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
-            else:
-                # 資料夾名稱格式：日期_時間_課程名稱
-                date_str, _, rest = pick.name.partition("_")
-                course_name = rest.partition("_")[2]
-                info = load_slides_info(pick)
-                slide_terms, fixed = info.get("terms", {}), load_fixed_terms(course_name)
-                make_notes((pick / "逐字稿_原文.txt").read_text(encoding="utf-8"), course_name, date_str, pick,
-                           merge_terms(slide_terms, fixed), fix_brief(info.get("summary", ""), slide_terms, fixed),
-                           language)
+    with st.expander("📂 Earlier classes — re-transcribe from the recording or generate notes"):
+        def _label(d: Path) -> str:
+            tags = [t for t, ok in (("recording", _has(d, "錄音.flac")), ("full transcript", _has(d, retranscribe.FULL_SOURCE)),
+                                    ("notes", _has(d, "筆記.md"))) if ok]
+            return d.name + (f"  ({', '.join(tags)})" if tags else "")
+        pick = st.selectbox("Class", saved, format_func=_label)
+        busy = bool(running and sess.cfg.out_dir == pick)      # 正在錄的這堂不能動
+        # 資料夾名稱格式：日期_時間_課程名稱
+        date_str, _, rest = pick.name.partition("_")
+        course_name = rest.partition("_")[2]
+        info = load_slides_info(pick)
+        slide_terms, fixed = info.get("terms", {}), load_fixed_terms(course_name)
+        background = fix_brief(info.get("summary", ""), slide_terms, fixed)
+        st.caption(f"Uses the Lecture language selected in the sidebar ({language}). "
+                   "Re-transcribing keeps the live transcript and saves a separate full one, then makes the notes.")
+        r1, r2 = st.columns(2)
+        do_re = r1.button("🎙 Re-transcribe from recording", type="primary", use_container_width=True,
+                          disabled=busy or not _has(pick, "錄音.flac"),
+                          help="Sends the whole recording to Mistral's file transcription (more accurate than live, "
+                               "and works when live recognition is down), translates it, then generates notes")
+        do_notes = r2.button("📝 Generate notes", use_container_width=True,
+                             disabled=busy or not (_has(pick, retranscribe.FULL_SOURCE) or _has(pick, "逐字稿_原文.txt")),
+                             help="Uses the full transcript if this class was re-transcribed, otherwise the live one")
+        notes_ok = False
+        if (do_re or do_notes) and not api_key:
+            st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
+        elif do_re:
+            with st.status("Re-transcribing from the recording…", expanded=True) as box:
+                try:
+                    lines = retranscribe.retranscribe(api_key, pick, course_name, language, slide_terms, fixed,
+                                                      background, trans_model, progress=box.write)
+                    live_n = len((pick / "逐字稿_原文.txt").read_text(encoding="utf-8").splitlines()) \
+                        if _has(pick, "逐字稿_原文.txt") else 0
+                    box.update(label=f"Re-transcribed: {len(lines)} lines (live transcript had {live_n})",
+                               state="complete", expanded=False)
+                except Exception as e:
+                    box.update(label=f"Re-transcribing failed: {e}", state="error")
+                    lines = None
+            notes_ok = bool(lines) and make_notes(
+                (pick / retranscribe.FULL_SOURCE).read_text(encoding="utf-8"), course_name, date_str, pick,
+                merge_terms(slide_terms, fixed), background, language)
+        elif do_notes:
+            src = retranscribe.FULL_SOURCE if _has(pick, retranscribe.FULL_SOURCE) else "逐字稿_原文.txt"
+            notes_ok = make_notes((pick / src).read_text(encoding="utf-8"), course_name, date_str, pick,
+                                  merge_terms(slide_terms, fixed), background, language)
+        # 筆記區塊在頁面上方、比這裡早畫，筆記做好後重新整理一次才看得到
+        if (do_re or do_notes) and api_key and notes_ok:
+            st.rerun()
 
 
 # ---------------------------------------------------------------- 側邊欄：修正譯名、進階設定
