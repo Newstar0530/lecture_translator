@@ -380,6 +380,33 @@ class ResearchLoggingTests(unittest.TestCase):
         finally:
             run.close()
 
+    # 13. 手動標記課堂情境（影片）：只記錄，不影響偵測與連線
+    def test_13_activity_marks(self):
+        def marks(s):
+            time.sleep(0.8)
+            self.assertTrue(s.mark_activity("video", start=True))
+            time.sleep(0.8)
+            s.mark_activity("video", start=False, seconds_ago=0.5, source="late_mark", note="fixed later")
+            time.sleep(0.3)
+            s.mark_activity("video", start=True)            # 沒按結束就停止錄音 → 自動補結束
+
+        run = Run(["text"], seconds=5, during=marks)
+        try:
+            rows = read_csv(run.out / core.ACTIVITY_LOG)
+            self.assertEqual([(r["event"], r["source"]) for r in rows],
+                             [("start", "button"), ("end", "late_mark"), ("start", "button"), ("end", "session_end")])
+            ts = [float(r["t_seconds"]) for r in rows]
+            self.assertEqual(ts, sorted(ts))
+            self.assertAlmostEqual(float(rows[1]["est_t_seconds"]), ts[1] - 0.5, places=2)
+            self.assertTrue(all(r["class_folder"] == run.out.name and r["captured_seq"] != "" for r in rows))
+            self.assertEqual(run.s.activity_open, {})
+            self.assertEqual(run.events("lost"), [])                             # 標記不會造成重連
+            cfg = __import__("json").loads((run.out / core.CONFIG_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(cfg["detector_version"], core.DETECTOR_VERSION)
+            self.check_audio_accounting(run)
+        finally:
+            run.close()
+
     # 寫檔失敗要看得到
     def test_12_log_write_failure_is_visible(self):
         errors = []

@@ -439,7 +439,17 @@ if running:
 else:
     start_clicked = b1.button("● Start recording", type="primary", use_container_width=True)
 can_note = bool(sess and not sess.running and sess.segments)
-note_clicked = b2.button("📝 Generate notes", disabled=not can_note, use_container_width=True)
+note_clicked = False
+if running:
+    # 研究用：手動標記教授在播影片（只記錄到 activity_events.csv，不影響字幕、偵測和重連）
+    video_on = "video" in sess.activity_open
+    if b2.button("🎬 Video ended" if video_on else "🎬 Video started", type="primary" if video_on else "secondary",
+                 use_container_width=True, key="video_btn",
+                 help="Mark when the lecturer starts / stops playing a video (for research logs only)"):
+        sess.mark_activity("video", start=not video_on)
+        st.rerun()
+else:
+    note_clicked = b2.button("📝 Generate notes", disabled=not can_note, use_container_width=True)
 show_en = b3.toggle("Show original text", value=True)
 # 清掉畫面上的字幕和筆記；存好的逐字稿、錄音、notes.md 檔案都不受影響，之後也能再產生筆記
 # 錄音中只有字幕區會每秒更新、按鈕不會，所以只要有錄音或筆記就讓它可以按
@@ -449,6 +459,20 @@ if b4.button("🗑 Clear", disabled=sess is None and not ss.notes, use_container
         ss.clear_from = len(sess.segments)
     ss.notes = ss.notes_path = ss.notion_url = None
     st.rerun()
+
+if running:
+    video_on = "video" in sess.activity_open
+    with st.popover("🎬 Marked late? / fix the video mark"):
+        st.caption("Pressed the button late, or forgot it? Mark when it really happened.")
+        ago = st.number_input("It happened how many seconds ago?", 0, 900, 30, step=10, key="video_ago")
+        c1, c2 = st.columns(2)
+        if c1.button("Video started then", use_container_width=True, key="video_late_start"):
+            sess.mark_activity("video", start=True, seconds_ago=ago, source="late_mark")
+            st.rerun()
+        if c2.button("Video ended then", use_container_width=True, key="video_late_end"):
+            sess.mark_activity("video", start=False, seconds_ago=ago, source="late_mark")
+            st.rerun()
+        st.caption("🎬 Video is marked as playing" if video_on else "No video marked as playing")
 
 if start_clicked:
     if not api_key:

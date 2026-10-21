@@ -129,6 +129,8 @@ streamlit run app.py
   - `handed`：交給 Mistral SDK（舊欄位 `audio_sent_seconds` 就是這個，名字保留不改）
   - `send_returned`：SDK 的 `send_audio()` 已經返回＝已寫進本機 WebSocket。**伺服器有沒有真的收到、有沒有處理，程式看不到（Unknown）**
   - `orphaned`：已經從佇列取出、但連線剛好被取消，沒交給 SDK 的段。目前每次重連通常會丟 1 段（100 毫秒），都有記錄；這次只記錄、不補送
+- `activity_events.csv`：上課時手動標記的課堂情境。錄音中主畫面的 **🎬 Video started / 🎬 Video ended** 按鈕（在原本「Generate notes」的位置）標記教授開始、停止播影片；晚按或忘了按，用下面的「🎬 Marked late? / fix the video mark」補記「N 秒前」。欄位：`t_seconds`（按下的時間，和其他 CSV 同一條時間軸）、`activity`（video）、`event`（start / end）、`source`（button / late_mark / session_end）、`claimed_offset_seconds`（補記的秒數）、`est_t_seconds`（推估的實際時間＝`t_seconds` − 補記秒數）、`captured_seq` / `handed_seq`、`class_folder`、`conn_id`。錄音停止時還標記著播放中，會自動補一筆 `session_end`。**只是記錄情境**：不會暫停或改變卡死偵測、重連；而且「在播影片」不等於「沒有要辨識的話」，分析時不能直接把影片期間的重連都當成誤報
+- `config.json` 的 `detector_version`：卡死偵測與重連策略的版本（目前 `stall-v1`）。只加紀錄功能時不變，偵測邏輯改了才會換；`code_version` 不同但 `detector_version` 相同的課堂，偵測策略一樣
 - `asr_events.csv`：每個不是辨識文字（`text.delta`）的 ASR 事件記一筆——`session.created`（含伺服器的 `request_id`、實際的 `target_streaming_delay_ms`）、`transcription.language`、`transcription.segment`（`seg_start_raw` / `seg_end_raw` 原樣保留：還不確定是以這條連線開頭還是整段音訊為 0）、`transcription.done`、`error`、未知事件。`text.delta` 只記在 `subtitle_latency.csv`，不會重複
 - `subtitle_latency.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `recording.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
 - `health_metrics.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）、這一秒麥克風 input overflow 次數（`input_overflows`，表示有音訊被系統丟掉）、各階段音訊序號、累計 orphaned 段數。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻

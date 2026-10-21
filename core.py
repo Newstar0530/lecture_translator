@@ -369,6 +369,13 @@ HEALTH_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "loud_chunks", "chunks
                      "since_last_text_seconds", "down", "audio_sent_seconds", "backlog_seconds",
                      "input_overflows", "captured_seq", "dequeued_seq", "handed_seq", "send_returned_seq",
                      "orphaned_chunks"]
+ACTIVITY_LOG = "activity_events.csv"      # 上課時手動標記的課堂情境（例如播影片開始／結束），只記錄、不影響偵測
+ACTIVITY_LOG_FIELDS = ["wall_time", "t_seconds", "class_folder", "conn_id", "activity", "event", "source",
+                       "claimed_offset_seconds", "est_t_seconds", "captured_seq", "handed_seq",
+                       "audio_captured_seconds", "note"]
+# 卡死偵測與重連策略的版本：偵測邏輯有任何改變就要換這個字串（只加紀錄功能時不用換）
+DETECTOR_VERSION = ("stall-v1: reconnect when no text > 30 s and >= 150 chunks (100 ms) with level >= 0.5 "
+                    "since last text/connect; backoff min(2*failures, 10) s; server close -> reconnect at once")
 ASR_EVENT_LOG = "asr_events.csv"              # 每個不是 text.delta 的 ASR 事件記一筆（text.delta 只記在 subtitle_latency.csv）
 ASR_EVENT_LOG_FIELDS = ["wall_time", "t_seconds", "class_folder", "conn_id", "event_type", "text_chars",
                         "seg_start_raw", "seg_end_raw", "handed_seq", "audio_handed_seconds", "detail"]
@@ -532,6 +539,7 @@ class LiveSession:
         self._send_returned_count = 0
         self._orphaned_seqs: list[int] = []
         self._conn_stats = {"first": None, "last": None, "send_returned": None}   # 目前這條連線
+        self.activity_open: dict[str, float] = {}  # 目前標記為進行中的課堂情境 {"video": 標記的 t_seconds}
         self._sec_overflows = 0                     # 這一秒麥克風 input overflow 幾次
         self._overflows_total = 0
         self._seg_formed_at: dict[int, float] = {}   # 句子斷好（送去翻譯）的時間，算翻譯延遲用
@@ -562,7 +570,7 @@ class LiveSession:
         self._code_version = code_version()
         self._write_config()
         self._log_conn("start", detail=f"model={self.cfg.stt_model} language={self.cfg.language} "
-                                       f"stall_seconds={self.STALL_SECONDS}")
+                                       f"stall_seconds={self.STALL_SECONDS} detector={DETECTOR_VERSION.split(':')[0]}")
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -577,6 +585,34 @@ class LiveSession:
     def stop(self):
         self._stop.set()
         self._set_status("Stopping… (finishing the last lines)")
+
+    def mark_activity(self, activity: str, start: bool, seconds_ago: float = 0.0, source: str = "button",
+                      note: str = "") -> bool:
+        """上課時手動標記課堂情境（例如 activity="video"），寫一筆到 activity_events.csv。
+        只是記錄：不會暫停或改變卡死偵測、重連。seconds_ago 是「其實是幾秒前開始／結束的」（漏按時補記）。
+        回傳是否寫入成功。"""
+        now = time.monotonic()
+        t = now - self._t0
+        offset = max(float(seconds_ago or 0), 0.0)
+        with self.lock:
+            if start:
+                self.activity_open[activity] = t - offset
+            else:
+                self.activity_open.pop(activity, None)
+        row = {"wall_time": datetime.now().isoformat(timespec="milliseconds"), "t_seconds": round(t, 3),
+               "class_folder": self.cfg.out_dir.name, "conn_id": self._conn_id, "activity": activity,
+               "event": "start" if start else "end", "source": source,
+               "claimed_offset_seconds": round(offset, 1), "est_t_seconds": round(t - offset, 3),
+               "note": re.sub(r"\s+", " ", note)[:300]}
+        c = self._audio_counters()
+        row.update({k: c[k] for k in ("captured_seq", "handed_seq", "audio_captured_seconds")})
+        try:
+            with self.lock:
+                append_csv(self.cfg.out_dir / ACTIVITY_LOG, ACTIVITY_LOG_FIELDS, [row])
+            return True
+        except (OSError, ValueError) as e:
+            self._log_error(f"Could not write {ACTIVITY_LOG}: {e}")
+            return False
 
     def join(self, timeout: Optional[float] = None):
         if self._thread:
@@ -695,6 +731,7 @@ class LiveSession:
                if k not in ("api_key", "out_dir", "fixed_terms", "slide_terms", "slide_brief")}
         data = {
             "code_version": self._code_version,
+            "detector_version": DETECTOR_VERSION,
             "started_at": datetime.fromtimestamp(self.started_at).isoformat(timespec="milliseconds"),
             "t_seconds_origin": "t_seconds = 0 at started_at (monotonic clock)",
             "python": sys.version.split()[0], "mistralai_sdk": sdk, "platform": sys.platform,
@@ -749,6 +786,9 @@ class LiveSession:
             self.running = False
             self.ended_at = time.time()
             self._set_status("Stopped")
+            for activity in list(self.activity_open):  # 錄音結束時還標記著進行中 → 自動補一筆結束
+                self.mark_activity(activity, start=False, source="session_end",
+                                   note="still marked as ongoing when recording stopped")
             if self._down_since is not None:            # 結束時還沒恢復的那次也算進去
                 self._downtime += time.monotonic() - self._down_since
                 self._down_since = None
