@@ -3,7 +3,7 @@
 
 即時辨識斷線、卡住、聽錯的部分，下課後用 Mistral 的「整段錄音辨識」（voxtral-mini）重新辨識一次：
 看得到完整上下文、可以指定語言、可以給專有名詞提示，通常比即時辨識準。
-原本的即時逐字稿保留不動，結果另外存成「逐字稿_原文_完整.txt」「逐字稿_雙語_完整.md」。
+原本的即時逐字稿保留不動，結果另外存成「transcript_source_full.txt」「transcript_bilingual_full.md」。
 """
 from __future__ import annotations
 
@@ -24,9 +24,9 @@ BATCH_STT_MODEL = "voxtral-mini-2602"   # 固定版本（＝ 2026-10 的 voxtral
 PART_SECONDS = 600            # 每段 10 分鐘
 CUT_SEARCH_SECONDS = 30       # 在每段結尾前 30 秒內找最安靜的地方切
 LANG_CODES = {"English": "en", "French": "fr"}
-FULL_SOURCE = "逐字稿_原文_完整.txt"
-FULL_BILINGUAL = "逐字稿_雙語_完整.md"
-REFERENCE_TIMELINE = "reference_timeline.csv"   # 每個字在 錄音.flac 裡的開始、結束秒數（算有效字幕可用率的基準）
+FULL_SOURCE = "transcript_source_full.txt"
+FULL_BILINGUAL = "transcript_bilingual_full.md"
+REFERENCE_TIMELINE = "reference_timeline.csv"   # 每個字在 recording.flac 裡的開始、結束秒數（算有效字幕可用率的基準）
 
 Line = tuple[float, str]      # (開始秒數, 原文)
 Word = tuple[float, float, str]   # (開始秒數, 結束秒數, 文字；英文字前面通常帶空格)
@@ -116,7 +116,7 @@ def write_reference_timeline(path: Path, words: list[Word]):
 
 
 def _note_config(out_dir: Path, info: dict):
-    """把課後重新辨識用的模型和參數記進這堂課的 設定.json（沒有就新建）。"""
+    """把課後重新辨識用的模型和參數記進這堂課的 config.json（沒有就新建）。"""
     import json
     path = out_dir / CONFIG_FILE
     try:
@@ -149,11 +149,11 @@ def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "Engl
                  background: str = "", translate_model: str = DEFAULT_TRANSLATE_MODEL,
                  progress: Optional[Callable[[str], None]] = None, client=None) -> list[Line]:
     """
-    從 out_dir/錄音.flac 重新辨識整堂課並翻譯，存成完整逐字稿，回傳 [(開始秒數, 原文)]。
+    從 out_dir/recording.flac 重新辨識整堂課並翻譯，存成完整逐字稿，回傳 [(開始秒數, 原文)]。
     progress 只會在呼叫這個函式的執行緒裡被呼叫（Streamlit 可以直接拿來更新畫面）。
     """
     say = progress or (lambda s: None)
-    audio = out_dir / "錄音.flac"
+    audio = out_dir / "recording.flac"
     if not audio.exists():
         raise FileNotFoundError("這堂課沒有錄音檔（錄音時「Also save the recording」要打開）")
     if client is None:

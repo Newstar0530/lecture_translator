@@ -27,7 +27,7 @@ from core import (CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL
 
 APP_DIR = Path(__file__).parent
 RECORDS_DIR = APP_DIR / "records"
-TERMS_DIR = APP_DIR / "專有名詞"
+TERMS_DIR = APP_DIR / "terms"
 
 
 def load_env_key(name: str = "MISTRAL_API_KEY") -> str:
@@ -47,7 +47,7 @@ def safe_name(s: str) -> str:
 
 
 def load_fixed_terms(course: str) -> dict[str, str]:
-    """讀取這門課修正過的譯名（專有名詞/課程名稱.json）。"""
+    """讀取這門課修正過的譯名（terms/課程名稱.json）。"""
     f = TERMS_DIR / f"{safe_name(course)}.json"
     try:
         return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
@@ -55,7 +55,7 @@ def load_fixed_terms(course: str) -> dict[str, str]:
         return {}
 
 
-SLIDES_FILE = "簡報重點.json"
+SLIDES_FILE = "slides_summary.json"
 
 
 def load_slides_info(out_dir: Path) -> dict:
@@ -441,7 +441,7 @@ else:
 can_note = bool(sess and not sess.running and sess.segments)
 note_clicked = b2.button("📝 Generate notes", disabled=not can_note, use_container_width=True)
 show_en = b3.toggle("Show original text", value=True)
-# 清掉畫面上的字幕和筆記；存好的逐字稿、錄音、筆記.md 檔案都不受影響，之後也能再產生筆記
+# 清掉畫面上的字幕和筆記；存好的逐字稿、錄音、notes.md 檔案都不受影響，之後也能再產生筆記
 # 錄音中只有字幕區會每秒更新、按鈕不會，所以只要有錄音或筆記就讓它可以按
 if b4.button("🗑 Clear", disabled=sess is None and not ss.notes, use_container_width=True,
              help="Clear the subtitles and notes on screen. Saved files (transcript, recording, notes) are kept"):
@@ -483,14 +483,14 @@ if stop_clicked:
 
 def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
                glossary: dict[str, str], background: str, language: str = ""):
-    """產生筆記並存到 out_dir/筆記.md。分段結果先暫存，失敗後再按一次會接續。"""
-    cache_dir = out_dir / ".筆記暫存"
+    """產生筆記並存到 out_dir/notes.md。分段結果先暫存，失敗後再按一次會接續。"""
+    cache_dir = out_dir / ".notes_cache"
     with st.status("Generating notes…", expanded=True) as box:
         try:
             notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
                                    progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background,
                                    language=language)
-            path = out_dir / "筆記.md"
+            path = out_dir / "notes.md"
             path.write_text(notes, encoding="utf-8")
             shutil.rmtree(cache_dir, ignore_errors=True)
             ss.notes, ss.notes_path = notes, path
@@ -665,14 +665,14 @@ def _has(d: Path, name: str) -> bool:
 
 
 saved = sorted((d for d in RECORDS_DIR.glob("*/") if d.is_dir()
-                and (_has(d, "逐字稿_原文.txt") or _has(d, "錄音.flac"))),
+                and (_has(d, "transcript_source.txt") or _has(d, "recording.flac"))),
                reverse=True) if RECORDS_DIR.exists() else []
 if saved:
     st.divider()
     with st.expander("📂 Earlier classes — re-transcribe from the recording or generate notes"):
         def _label(d: Path) -> str:
-            tags = [t for t, ok in (("recording", _has(d, "錄音.flac")), ("full transcript", _has(d, retranscribe.FULL_SOURCE)),
-                                    ("notes", _has(d, "筆記.md"))) if ok]
+            tags = [t for t, ok in (("recording", _has(d, "recording.flac")), ("full transcript", _has(d, retranscribe.FULL_SOURCE)),
+                                    ("notes", _has(d, "notes.md"))) if ok]
             return d.name + (f"  ({', '.join(tags)})" if tags else "")
         pick = st.selectbox("Class", saved, format_func=_label)
         busy = bool(running and sess.cfg.out_dir == pick)      # 正在錄的這堂不能動
@@ -691,11 +691,11 @@ if saved:
                    "Re-transcribing keeps the live transcript and saves a separate full one, then makes the notes.")
         r1, r2 = st.columns(2)
         do_re = r1.button("🎙 Re-transcribe from recording", type="primary", use_container_width=True,
-                          disabled=busy or not _has(pick, "錄音.flac"),
+                          disabled=busy or not _has(pick, "recording.flac"),
                           help="Sends the whole recording to Mistral's file transcription (more accurate than live, "
                                "and works when live recognition is down), translates it, then generates notes")
         do_notes = r2.button("📝 Generate notes", use_container_width=True,
-                             disabled=busy or not (_has(pick, retranscribe.FULL_SOURCE) or _has(pick, "逐字稿_原文.txt")),
+                             disabled=busy or not (_has(pick, retranscribe.FULL_SOURCE) or _has(pick, "transcript_source.txt")),
                              help="Uses the full transcript if this class was re-transcribed, otherwise the live one")
         notes_ok = False
         if (do_re or do_notes) and not api_key:
@@ -705,8 +705,8 @@ if saved:
                 try:
                     lines = retranscribe.retranscribe(api_key, pick, course_name, language, slide_terms, fixed,
                                                       background, trans_model, progress=box.write)
-                    live_n = len((pick / "逐字稿_原文.txt").read_text(encoding="utf-8").splitlines()) \
-                        if _has(pick, "逐字稿_原文.txt") else 0
+                    live_n = len((pick / "transcript_source.txt").read_text(encoding="utf-8").splitlines()) \
+                        if _has(pick, "transcript_source.txt") else 0
                     box.update(label=f"Re-transcribed: {len(lines)} lines (live transcript had {live_n})",
                                state="complete", expanded=False)
                 except Exception as e:
@@ -716,7 +716,7 @@ if saved:
                 (pick / retranscribe.FULL_SOURCE).read_text(encoding="utf-8"), course_name, date_str, pick,
                 merge_terms(slide_terms, fixed), background, language)
         elif do_notes:
-            src = retranscribe.FULL_SOURCE if _has(pick, retranscribe.FULL_SOURCE) else "逐字稿_原文.txt"
+            src = retranscribe.FULL_SOURCE if _has(pick, retranscribe.FULL_SOURCE) else "transcript_source.txt"
             notes_ok = make_notes((pick / src).read_text(encoding="utf-8"), course_name, date_str, pick,
                                   merge_terms(slide_terms, fixed), background, language)
         # 筆記區塊在頁面上方、比這裡早畫，筆記做好後重新整理一次才看得到

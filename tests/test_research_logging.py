@@ -190,7 +190,7 @@ class ResearchLoggingTests(unittest.TestCase):
         self.assertEqual(sum(b - a + 1 for a, b in spans) - self._orphans_inside(run, spans), a["handed_chunks"])
         # FLAC 和收音完全一致
         import soundfile as sf
-        flac_frames = sf.info(str(run.out / "錄音.flac")).frames
+        flac_frames = sf.info(str(run.out / "recording.flac")).frames
         self.assertEqual(flac_frames, run.expected_samples, "FLAC has every injected sample")
         self.assertAlmostEqual(flac_frames / SR, float(run.conn[-1]["audio_captured_seconds"]), places=1)
 

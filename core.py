@@ -354,9 +354,9 @@ CONN_LOG_FIELDS = ["time", "t_seconds", "code_version", "course", "class_folder"
                    "captured_seq", "dequeued_seq", "handed_seq", "send_returned_seq",
                    "conn_first_handed_seq", "conn_last_handed_seq", "conn_last_send_returned_seq",
                    "queued_chunks", "orphaned_chunks"]
-CONFIG_FILE = "設定.json"                  # 每堂課一份：程式版本與所有門檻、模型設定（之後比較不同課堂用）
+CONFIG_FILE = "config.json"                  # 每堂課一份：程式版本與所有門檻、模型設定（之後比較不同課堂用）
 
-# 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 錄音.flac 做 trace-driven 模擬）
+# 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 recording.flac 做 trace-driven 模擬）
 LATENCY_LOG = "subtitle_latency.csv"               # 每收到一段辨識文字記一筆
 LATENCY_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "audio_sent_seconds", "audio_captured_seconds",
                       "backlog_seconds", "chars", "text", "handed_seq", "captured_seq"]
@@ -496,9 +496,9 @@ class LiveSession:
         self._buffer = SentenceBuffer(min_chars=cfg.min_chars)
         self._audio_q: "thread_queue.Queue[tuple[int, bytes]]" = thread_queue.Queue()   # (seq, PCM)
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
-        self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
-        self.source_path = cfg.out_dir / "逐字稿_原文.txt"
-        self.audio_path = cfg.out_dir / "錄音.flac"
+        self.transcript_path = cfg.out_dir / "transcript_bilingual.md"
+        self.source_path = cfg.out_dir / "transcript_source.txt"
+        self.audio_path = cfg.out_dir / "recording.flac"
         self._audio_file = None
         self._caffeinate: Optional[subprocess.Popen] = None
         self._producer: Optional[threading.Thread] = None
@@ -512,7 +512,7 @@ class LiveSession:
         # 研究用量測：_last_text_real 不會因為重連而重設（卡死偵測用的 _last_text_at 會）
         self._last_text_real = time.monotonic()
         self._t0 = time.monotonic()
-        self.audio_captured_seconds = 0.0          # 收到的音訊（= 錄音.flac 裡的位置）
+        self.audio_captured_seconds = 0.0          # 收到的音訊（= recording.flac 裡的位置）
         self._conn_id = 0
         self._sec_chunks = self._sec_loud = self._sec_chars = 0   # 這一秒的累計（每秒歸零）
         self._meter_lock = threading.Lock()         # 收音執行緒和健康紀錄同時改計數用
@@ -684,7 +684,7 @@ class LiveSession:
         self._connect_started_at = None
 
     def _write_config(self):
-        """把這堂課用的程式版本、模型、所有門檻存成 設定.json，之後比較不同課堂時知道條件是否一樣。"""
+        """把這堂課用的程式版本、模型、所有門檻存成 config.json，之後比較不同課堂時知道條件是否一樣。"""
         try:
             from importlib.metadata import version
             sdk = version("mistralai")

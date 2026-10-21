@@ -4,7 +4,7 @@
 
 ```
 麥克風 → Voxtral Realtime（語音轉文字）→ 斷句 → Mistral 翻譯成繁中 → 畫面即時顯示＋自動存檔
-下課 → 按「Generate notes」→ Mistral 分段整理 → 筆記.md
+下課 → 按「Generate notes」→ Mistral 分段整理 → notes.md
 ```
 
 ---
@@ -51,14 +51,14 @@ streamlit run app.py
 1. 左邊填 **Course name**（課程名稱），在 **Lecture language** 選這堂課主要的授課語言（English / French，預設 English）。語音辨識會自動判斷語言，這個設定是讓翻譯和筆記知道該用哪個語言來理解
 2. （建議）在 **Lecture slides** 上傳這堂課的簡報（PDF 或 PPTX）。程式會先讀一遍（約 10 秒），整理出這堂課的領域和簡報裡的專有名詞譯名：翻譯會依照這個領域用詞、專有名詞採用通用譯名，筆記也會照用。側邊欄會顯示讀到的摘要和名詞清單，有翻錯的可以用下面的「Fix a translation」改掉。簡報檔最大 500 MB；很長的簡報（大約超過 80–100 頁）會自動分批同時讀完（約 10–20 秒），最多分 8 批（約 700 頁以上才會略過後面的頁面，側邊欄會提醒）
 3. 按 **● Start recording** → 中文字幕即時出現，最新一句會放大顯示，原文在下面（可以用「Show original text」關掉）
-   畫面字幕太多想清掉，按 **🗑 Clear**：清掉畫面上的字幕和筆記；已存的逐字稿、錄音、`筆記.md` 檔案都還在，之後也能再按「Generate notes」重新產生，新字幕照常出現
+   畫面字幕太多想清掉，按 **🗑 Clear**：清掉畫面上的字幕和筆記；已存的逐字稿、錄音、`notes.md` 檔案都還在，之後也能再按「Generate notes」重新產生，新字幕照常出現
 4. 下課按 **⏹ Stop**（會多等幾秒，把最後幾句辨識和翻譯完）
 5. 按 **📝 Generate notes**
 
 **修正翻錯的專有名詞**：側邊欄的「Fix a translation」，「Term (original)」填沒翻好的原文名詞（例如 `merit goods`），「Correct translation」填查到的正確翻譯（例如 `有益財`），按「Apply」：
 - **之後的翻譯**馬上改用新譯名（已經顯示的舊翻譯不會改）
 - **產生筆記**時全部用你修正過的譯名
-- 修正會依課程名稱存在 `專有名詞/` 資料夾，**下次填同一個課程名稱自動套用**
+- 修正會依課程名稱存在 `terms/` 資料夾，**下次填同一個課程名稱自動套用**
 - 簡報讀出來的譯名偶爾也會錯（例如把 merit goods 音譯成「梅里特財」），用這裡修正就會蓋掉簡報的譯名
 - 請填**完整的名詞**，不要只填 `board`、`goods` 這種常見單字：翻譯模型不太會分辨同一個字的不同意思，可能把「寫在黑板上」也翻成「董事會」
 
@@ -91,10 +91,10 @@ streamlit run app.py
 
 | 檔案 | 內容 | 什麼時候產生 |
 |---|---|---|
-| `逐字稿_原文.txt` | 語音辨識原文（含時間戳） | 錄音中**即時寫入** |
-| `逐字稿_雙語.md` | 原文＋繁中翻譯對照 | 錄音中**即時寫入** |
-| `錄音.flac` | 上課錄音（無損壓縮，可以直接用 QuickTime 播放），每小時約 60–90 MB。不想存可以在「Audio」關掉「Also save the recording (FLAC)」 | 錄音中**即時寫入** |
-| `筆記.md` | 整理好的筆記（摘要、詳細筆記、作業提醒、專有名詞表、待確認處） | 按「Generate notes」後 |
+| `transcript_source.txt` | 語音辨識原文（含時間戳） | 錄音中**即時寫入** |
+| `transcript_bilingual.md` | 原文＋繁中翻譯對照 | 錄音中**即時寫入** |
+| `recording.flac` | 上課錄音（無損壓縮，可以直接用 QuickTime 播放），每小時約 60–90 MB。不想存可以在「Audio」關掉「Also save the recording (FLAC)」 | 錄音中**即時寫入** |
+| `notes.md` | 整理好的筆記（摘要、詳細筆記、作業提醒、專有名詞表、待確認處） | 按「Generate notes」後 |
 
 逐字稿是一邊錄一邊存的，就算程式當掉或網路斷掉，已經辨識的內容也不會不見。
 錄音中不小心重新整理或關掉網頁也沒關係：重新打開 http://localhost:8501 就會接回正在進行的錄音。
@@ -122,25 +122,25 @@ streamlit run app.py
 - 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
 
 研究用量測（課程資料夾裡，每 5 秒寫檔一次；寫不進去不影響錄音，但會在畫面的 ⚠️ Messages 顯示）：
-- `設定.json`：這堂課的程式版本（git commit）、模型、語言、卡死偵測門檻、重連與翻譯重試規則、斷句參數、健康指標每個欄位的統計視窗、`t_seconds` 的起點時間；課後重新辨識時也會把用的模型記進來。研究期間改了設定也查得出每堂課用哪一組
+- `config.json`：這堂課的程式版本（git commit）、模型、語言、卡死偵測門檻、重連與翻譯重試規則、斷句參數、健康指標每個欄位的統計視窗、`t_seconds` 的起點時間；課後重新辨識時也會把用的模型記進來。研究期間改了設定也查得出每堂課用哪一組
 - **音訊序號**：每段 100 毫秒的音訊在收音時編號（0、1、2…），依序經過
-  - `captured`：收音、寫進 `錄音.flac`、放進佇列（序號 n 的音訊就是 `錄音.flac` 第 n×0.1 秒起的那段）
+  - `captured`：收音、寫進 `recording.flac`、放進佇列（序號 n 的音訊就是 `recording.flac` 第 n×0.1 秒起的那段）
   - `dequeued`：背景執行緒從佇列取出
   - `handed`：交給 Mistral SDK（舊欄位 `audio_sent_seconds` 就是這個，名字保留不改）
   - `send_returned`：SDK 的 `send_audio()` 已經返回＝已寫進本機 WebSocket。**伺服器有沒有真的收到、有沒有處理，程式看不到（Unknown）**
   - `orphaned`：已經從佇列取出、但連線剛好被取消，沒交給 SDK 的段。目前每次重連通常會丟 1 段（100 毫秒），都有記錄；這次只記錄、不補送
 - `asr_events.csv`：每個不是辨識文字（`text.delta`）的 ASR 事件記一筆——`session.created`（含伺服器的 `request_id`、實際的 `target_streaming_delay_ms`）、`transcription.language`、`transcription.segment`（`seg_start_raw` / `seg_end_raw` 原樣保留：還不確定是以這條連線開頭還是整段音訊為 0）、`transcription.done`、`error`、未知事件。`text.delta` 只記在 `subtitle_latency.csv`，不會重複
-- `subtitle_latency.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
+- `subtitle_latency.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `recording.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
 - `health_metrics.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）、這一秒麥克風 input overflow 次數（`input_overflows`，表示有音訊被系統丟掉）、各階段音訊序號、累計 orphaned 段數。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
 - `translation_latency.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `subtitle_latency.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
 
 ## 下課後從錄音檔重新辨識
 
 即時字幕斷掉、卡住，或聽錯很多時，下課後打開主畫面最下面的「📂 Earlier classes」，選那堂課，按 **🎙 Re-transcribe from recording**：
-- 把整段 `錄音.flac` 交給 Mistral 的「整段錄音辨識」（voxtral-mini），看得到完整上下文，通常比即時辨識準；即時辨識塞車、當掉的時候也能用
+- 把整段 `recording.flac` 交給 Mistral 的「整段錄音辨識」（voxtral-mini），看得到完整上下文，通常比即時辨識準；即時辨識塞車、當掉的時候也能用
 - 會照側邊欄 **Lecture language** 指定語言，並把簡報和修正過的專有名詞當作辨識提示
-- 原本的即時逐字稿保留不動，結果另外存成 `逐字稿_原文_完整.txt`、`逐字稿_雙語_完整.md`，接著自動產生筆記
-- 同時存一份 `reference_timeline.csv`：每個字在 `錄音.flac` 裡的開始、結束秒數。和 `subtitle_latency.csv` 對照，可以算每段話的字幕有沒有及時出現（有效字幕可用率）（之後按「Generate notes」也會優先用完整版）
+- 原本的即時逐字稿保留不動，結果另外存成 `transcript_source_full.txt`、`transcript_bilingual_full.md`，接著自動產生筆記（之後按「Generate notes」也會優先用完整版）
+- 同時存一份 `reference_timeline.csv`：每個字在 `recording.flac` 裡的開始、結束秒數。和 `subtitle_latency.csv` 對照，可以算每段話的字幕有沒有及時出現（有效字幕可用率）
 - 一堂 30 分鐘的課大約 40 秒完成；需要錄音時有打開「Also save the recording」
 
 ## 專有名詞閃卡
