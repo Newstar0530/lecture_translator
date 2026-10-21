@@ -108,19 +108,30 @@ streamlit run app.py
 - 所有課程一份總表：`records/連線紀錄_全部.csv`（可以用 Excel / Numbers 打開）
 - 欄位：
   - `time`（到毫秒）、`t_seconds`（從開始錄音算起，和下面的研究用 CSV 同一個起點，可直接對齊）、`code_version`（程式的 git commit）、課程、`class_folder`、`conn_id`（第幾條連線）
-  - `event`：start / lost / reconnect_start / session_created / recovered / end
+  - `event`：start / stall_detected / lost / reconnect_start / session_created / recovered / end
+    - `stall_detected`：判定卡死的當下（關連線之前）；接著的 `lost` 要等連線關完才記，兩者的時間差就是關閉花的時間
+    - 伺服器自己結束連線（沒有錯誤）時也會記一筆 `lost`，`error_type` 是 `StreamEnded` 或 `TranscriptionDone`（這種情況原本就馬上重連、不等待）
   - `category`：原因分類（server busy、server crash、server restart、silent stall、network、microphone…）；`error_type`：錯誤類別與代碼（例如 `ConnectionClosedError:1012`、`ServerErrorEvent:3001`、`SilentStall`）；`detail`：原始錯誤訊息
   - `attempt`：第幾次重試
   - `since_last_text_seconds`：當時已經多久沒收到字幕（使用者實際沒字幕的時間，例如 silent stall ≈ 30 秒偵測＋重連）
   - `since_lost_seconds`：從宣告斷線起過了多久；`connect_seconds`：建立連線花多久；`downtime_seconds`：從宣告斷線到字幕恢復
+  - 音訊追蹤（每一筆都有）：`loud_chunks_since_text`（上次收到文字後有幾格明顯說話聲）、`audio_captured_seconds`、`audio_handed_seconds`、各階段最後一段的序號 `captured_seq` / `dequeued_seq` / `handed_seq` / `send_returned_seq`、目前這條連線實際交給 SDK 的第一段與最後一段 `conn_first_handed_seq` / `conn_last_handed_seq` / `conn_last_send_returned_seq`、`queued_chunks`（還在佇列）、`orphaned_chunks`（累計被取消競態丟掉的段數）
+  - `end` 的 `detail` 有整堂課的音訊核對：`captured_chunks`、`dequeued_chunks`、`handed_chunks`、`send_returned_chunks`、`orphaned_chunks`、`orphaned_seqs`、`input_overflows`
 - 一次中斷拆成「偵測（lost）→ 等待 → 開始連線（reconnect_start）→ 連上（session_created）→ 第一筆字幕（recovered）」
 - 欄位改過時，舊檔會改名成 `…_舊格式_日期時間.csv` 保留，新資料寫進新檔，不會混在一起
 - 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
 
-研究用量測（課程資料夾裡，每 5 秒寫檔一次，寫不進去也不影響錄音）：
+研究用量測（課程資料夾裡，每 5 秒寫檔一次；寫不進去不影響錄音，但會在畫面的 ⚠️ Messages 顯示）：
 - `設定.json`：這堂課的程式版本（git commit）、模型、語言、卡死偵測門檻、重連與翻譯重試規則、斷句參數、健康指標每個欄位的統計視窗、`t_seconds` 的起點時間；課後重新辨識時也會把用的模型記進來。研究期間改了設定也查得出每堂課用哪一組
+- **音訊序號**：每段 100 毫秒的音訊在收音時編號（0、1、2…），依序經過
+  - `captured`：收音、寫進 `錄音.flac`、放進佇列（序號 n 的音訊就是 `錄音.flac` 第 n×0.1 秒起的那段）
+  - `dequeued`：背景執行緒從佇列取出
+  - `handed`：交給 Mistral SDK（舊欄位 `audio_sent_seconds` 就是這個，名字保留不改）
+  - `send_returned`：SDK 的 `send_audio()` 已經返回＝已寫進本機 WebSocket。**伺服器有沒有真的收到、有沒有處理，程式看不到（Unknown）**
+  - `orphaned`：已經從佇列取出、但連線剛好被取消，沒交給 SDK 的段。目前每次重連通常會丟 1 段（100 毫秒），都有記錄；這次只記錄、不補送
+- `ASR事件.csv`：每個不是辨識文字（`text.delta`）的 ASR 事件記一筆——`session.created`（含伺服器的 `request_id`、實際的 `target_streaming_delay_ms`）、`transcription.language`、`transcription.segment`（`seg_start_raw` / `seg_end_raw` 原樣保留：還不確定是以這條連線開頭還是整段音訊為 0）、`transcription.done`、`error`、未知事件。`text.delta` 只記在 `字幕時效.csv`，不會重複
 - `字幕時效.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
-- `健康指標.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
+- `健康指標.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）、這一秒麥克風 input overflow 次數（`input_overflows`，表示有音訊被系統丟掉）、各階段音訊序號、累計 orphaned 段數。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
 - `翻譯時效.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `字幕時效.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
 
 ## 下課後從錄音檔重新辨識
@@ -199,3 +210,13 @@ streamlit run app.py
 | `.env.example` | API Key 設定範本 |
 | `run.command` | 雙擊啟動 |
 | `.streamlit/config.toml` | 只允許本機連線（同一個 Wi-Fi 的人連不進來） |
+
+## 研究用紀錄的自動化測試
+
+不需要網路和麥克風（用假的 Mistral client 和產生的測試音訊），大約 1 分多鐘：
+
+```bash
+.venv/bin/python -m unittest tests.test_research_logging -v
+```
+
+涵蓋正常串流、長時間靜音、silent stall、1012、伺服器正常關閉、連續重連失敗、重連期間積壓、取消競態、音訊序號連續、非 delta 事件、麥克風 overflow、寫檔失敗。測試裡的「伺服器收到」是假 client 收到的，真實網路上伺服器有沒有收到無法從程式驗證。

@@ -348,28 +348,46 @@ CONN_LOG = "連線紀錄.csv"                  # 每堂課一份（在課程資�
 CONN_LOG_ALL = "連線紀錄_全部.csv"         # 所有課程一份總表（在 records/ 裡）
 CONN_LOG_FIELDS = ["time", "t_seconds", "code_version", "course", "class_folder", "conn_id", "event", "category",
                    "error_type", "attempt", "since_last_text_seconds", "since_lost_seconds", "connect_seconds",
-                   "downtime_seconds", "detail"]
+                   "downtime_seconds", "detail",
+                   # 以下是研究用的音訊追蹤欄位（加在最後，舊欄位位置不變）
+                   "loud_chunks_since_text", "audio_captured_seconds", "audio_handed_seconds",
+                   "captured_seq", "dequeued_seq", "handed_seq", "send_returned_seq",
+                   "conn_first_handed_seq", "conn_last_handed_seq", "conn_last_send_returned_seq",
+                   "queued_chunks", "orphaned_chunks"]
 CONFIG_FILE = "設定.json"                  # 每堂課一份：程式版本與所有門檻、模型設定（之後比較不同課堂用）
 
 # 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 錄音.flac 做 trace-driven 模擬）
 LATENCY_LOG = "字幕時效.csv"               # 每收到一段辨識文字記一筆
 LATENCY_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "audio_sent_seconds", "audio_captured_seconds",
-                      "backlog_seconds", "chars", "text"]
+                      "backlog_seconds", "chars", "text", "handed_seq", "captured_seq"]
 TRANSLATION_LOG = "翻譯時效.csv"           # 每句話翻譯完（或放棄）記一筆
 TRANSLATION_LOG_FIELDS = ["wall_time", "idx", "segment_t_seconds", "start_t_seconds", "done_t_seconds",
                           "queue_seconds", "translate_seconds", "total_seconds", "attempts", "ok",
                           "audio_sent_seconds", "chars", "error"]
 HEALTH_LOG = "健康指標.csv"                # 每秒記一筆
 HEALTH_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "loud_chunks", "chunks", "text_chars",
-                     "since_last_text_seconds", "down", "audio_sent_seconds", "backlog_seconds"]
+                     "since_last_text_seconds", "down", "audio_sent_seconds", "backlog_seconds",
+                     "input_overflows", "captured_seq", "dequeued_seq", "handed_seq", "send_returned_seq",
+                     "orphaned_chunks"]
+ASR_EVENT_LOG = "ASR事件.csv"              # 每個不是 text.delta 的 ASR 事件記一筆（text.delta 只記在 字幕時效.csv）
+ASR_EVENT_LOG_FIELDS = ["wall_time", "t_seconds", "class_folder", "conn_id", "event_type", "text_chars",
+                        "seg_start_raw", "seg_end_raw", "handed_seq", "audio_handed_seconds", "detail"]
+# 音訊序號（seq）：每段 100 毫秒的音訊在收音時編號，從 0 開始遞增
+#   captured  收音並放進 _audio_q 的最後一段
+#   dequeued  從 _audio_q 取出的最後一段（在背景執行緒）
+#   handed    交給 SDK（Python generator yield 出去）的最後一段；audio_sent_seconds / audio_handed_seconds 就是這個
+#   send_returned  SDK 的 send_audio() 已經返回（寫進本機 WebSocket）的最後一段；伺服器有沒有收到：無法觀測（Unknown）
+#   orphaned  已經從 _audio_q 取出、但因為連線取消而沒交給 SDK 的段數（取消時的競態，這些音訊不會被辨識）
 
 
 class _CsvBuffer:
     """先放在記憶體，每幾秒整批寫進 CSV（寫不進去就丟掉，不影響錄音）。"""
 
-    def __init__(self, path: Path, fields: list[str]):
+    def __init__(self, path: Path, fields: list[str], on_error: Optional[Callable[[str], None]] = None):
         self.path, self.fields = path, fields
         self.rows: list[dict] = []
+        self.on_error = on_error
+        self.failures = 0                  # 寫檔失敗幾次（失敗的那批資料就丟掉了）
 
     def add(self, row: dict):
         self.rows.append(row)
@@ -380,8 +398,11 @@ class _CsvBuffer:
             return
         try:
             append_csv(self.path, self.fields, rows)
-        except OSError:
-            pass
+        except (OSError, ValueError) as e:
+            self.failures += 1
+            if self.on_error and self.failures in (1, 10, 100):   # 不要每 5 秒都跳一次
+                self.on_error(f"Research log {self.path.name} could not be written "
+                              f"({self.failures} time(s), {len(rows)} rows lost): {e}")
 
 
 def append_csv(path: Path, fields: list[str], rows: list[dict]):
@@ -414,8 +435,8 @@ class ServerErrorEvent(ConnectionError):
 
 def error_type(e: BaseException) -> str:
     """錯誤的類別名稱＋代碼（例如 ServerErrorEvent:3001、ConnectionClosedError:1012），統計故障原因用。"""
-    code = (getattr(e, "code", None) or getattr(e, "status_code", None)
-            or getattr(getattr(e, "rcvd", None), "code", None))
+    code = (getattr(getattr(e, "rcvd", None), "code", None)       # websockets 的 close code（例如 1012）
+            or getattr(e, "status_code", None) or getattr(e, "code", None))
     name = type(e).__name__
     return f"{name}:{str(code)[:40]}" if code not in (None, "") else name
 
@@ -436,7 +457,9 @@ def code_version() -> str:
 def classify_problem(msg: str) -> str:
     """把錯誤訊息歸類成看得懂的原因，方便之後統計是哪一種問題最多。"""
     m = msg.lower()
-    for key, label in (("toomanyrequests", "server busy (TooManyRequests)"),
+    for key, label in (("transcriptiondone", "server ended stream (transcription.done)"),
+                       ("streamended", "server ended stream (no error)"),
+                       ("toomanyrequests", "server busy (TooManyRequests)"),
                        ("queueoverflow", "server busy (QueueOverflow)"),
                        ("enginedead", "server crash (EngineDead)"),
                        ("1012", "server restart (1012)"),
@@ -471,7 +494,7 @@ class LiveSession:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._buffer = SentenceBuffer(min_chars=cfg.min_chars)
-        self._audio_q: "thread_queue.Queue[bytes]" = thread_queue.Queue()
+        self._audio_q: "thread_queue.Queue[tuple[int, bytes]]" = thread_queue.Queue()   # (seq, PCM)
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = cfg.out_dir / "逐字稿_雙語.md"
         self.source_path = cfg.out_dir / "逐字稿_原文.txt"
@@ -493,9 +516,24 @@ class LiveSession:
         self._conn_id = 0
         self._sec_chunks = self._sec_loud = self._sec_chars = 0   # 這一秒的累計（每秒歸零）
         self._meter_lock = threading.Lock()         # 收音執行緒和健康紀錄同時改計數用
-        self._latency_log = _CsvBuffer(cfg.out_dir / LATENCY_LOG, LATENCY_LOG_FIELDS)
-        self._health_log = _CsvBuffer(cfg.out_dir / HEALTH_LOG, HEALTH_LOG_FIELDS)
-        self._translation_log = _CsvBuffer(cfg.out_dir / TRANSLATION_LOG, TRANSLATION_LOG_FIELDS)
+        self._latency_log = _CsvBuffer(cfg.out_dir / LATENCY_LOG, LATENCY_LOG_FIELDS, self._log_error)
+        self._health_log = _CsvBuffer(cfg.out_dir / HEALTH_LOG, HEALTH_LOG_FIELDS, self._log_error)
+        self._translation_log = _CsvBuffer(cfg.out_dir / TRANSLATION_LOG, TRANSLATION_LOG_FIELDS, self._log_error)
+        self._asr_event_log = _CsvBuffer(cfg.out_dir / ASR_EVENT_LOG, ASR_EVENT_LOG_FIELDS, self._log_error)
+        self._conn_log_failures = 0
+        # 音訊序號追蹤（見 ASR_EVENT_LOG 上面的說明）；都用 _meter_lock 保護
+        self._next_seq = 0
+        self._captured_seq: Optional[int] = None
+        self._dequeued_seq: Optional[int] = None
+        self._dequeued_count = 0
+        self._handed_seq: Optional[int] = None
+        self._handed_count = 0
+        self._send_returned_seq: Optional[int] = None
+        self._send_returned_count = 0
+        self._orphaned_seqs: list[int] = []
+        self._conn_stats = {"first": None, "last": None, "send_returned": None}   # 目前這條連線
+        self._sec_overflows = 0                     # 這一秒麥克風 input overflow 幾次
+        self._overflows_total = 0
         self._seg_formed_at: dict[int, float] = {}   # 句子斷好（送去翻譯）的時間，算翻譯延遲用
         self.levels: deque[float] = deque(maxlen=20)   # 最近 2 秒的音量（每 100 毫秒一格，0–1），畫音量表用
         self._written_upto = 0
@@ -572,7 +610,7 @@ class LiveSession:
     def _log_conn(self, event: str, category: str = "", attempt: Optional[int] = None,
                   downtime: Optional[float] = None, detail: str = "", error: str = "",
                   since_last_text: Optional[float] = None, since_lost: Optional[float] = None,
-                  connect: Optional[float] = None):
+                  connect: Optional[float] = None, loud: Optional[int] = None):
         """寫一筆連線紀錄到這堂課的 連線紀錄.csv 和 records/連線紀錄_全部.csv（寫不進去也不影響錄音）。
         t_seconds 和其他研究用 CSV 用同一個起點，可以直接對齊；秒數欄位都用 monotonic 時鐘算。"""
         def sec(x):
@@ -584,22 +622,41 @@ class LiveSession:
                "attempt": "" if attempt is None else attempt,
                "since_last_text_seconds": sec(since_last_text), "since_lost_seconds": sec(since_lost),
                "connect_seconds": sec(connect), "downtime_seconds": sec(downtime),
-               "detail": re.sub(r"\s+", " ", detail)[:500]}
+               "detail": re.sub(r"\s+", " ", detail)[:500],
+               "loud_chunks_since_text": "" if loud is None else loud}
+        row.update(self._audio_counters())
         for path in (self.cfg.out_dir / CONN_LOG, self.cfg.out_dir.parent / CONN_LOG_ALL):
             try:
                 with self.lock:
                     append_csv(path, CONN_LOG_FIELDS, [row])
-            except OSError:
-                pass
+            except (OSError, ValueError) as e:
+                self._conn_log_failures += 1
+                if self._conn_log_failures in (1, 10, 100):
+                    self._log_error(f"Connection log {path.name} could not be written: {e}")
 
-    def _went_down(self, msg: str, attempt: int, err: str = ""):
+    def _audio_counters(self) -> dict:
+        """目前的音訊序號與佇列狀態（研究用；欄位意思見 ASR_EVENT_LOG 上面的說明）。"""
+        def v(x):
+            return "" if x is None else x
+        with self._meter_lock:
+            c = self._conn_stats
+            return {"audio_captured_seconds": round(self.audio_captured_seconds, 2),
+                    "audio_handed_seconds": round(self.audio_seconds, 2),
+                    "captured_seq": v(self._captured_seq), "dequeued_seq": v(self._dequeued_seq),
+                    "handed_seq": v(self._handed_seq), "send_returned_seq": v(self._send_returned_seq),
+                    "conn_first_handed_seq": v(c["first"]), "conn_last_handed_seq": v(c["last"]),
+                    "conn_last_send_returned_seq": v(c["send_returned"]),
+                    "queued_chunks": self._next_seq - self._dequeued_count,
+                    "orphaned_chunks": len(self._orphaned_seqs)}
+
+    def _went_down(self, msg: str, attempt: Optional[int], err: str = ""):
         """斷線或卡死：記一筆，並開始計算斷了多久。"""
         if self._down_since is None:
             self._down_since = time.monotonic()
             self._drops += 1
         # downtime_seconds 只從宣告斷線起算；since_last_text 是偵測時已經多久沒字幕（例如 silent stall ≈ 30 秒）
         self._log_conn("lost", classify_problem(f"{err} {msg}"), attempt, detail=msg, error=err,
-                       since_last_text=time.monotonic() - self._last_text_real)
+                       since_last_text=time.monotonic() - self._last_text_real, loud=self._loud_since_text)
 
     def _came_back(self):
         """又收到文字（或麥克風恢復）：記一筆恢復，附上斷了多久。"""
@@ -659,12 +716,16 @@ class LiveSession:
                                "instantaneous value at the tick",
                            "loud_chunk": f"{CHUNK_MS} ms chunk with level >= {self.LOUD_LEVEL}"},
             "ui_refresh_seconds": 1.0,
+            "audio_seq": "each 100 ms chunk gets seq 0,1,2,... at capture; see ASR事件.csv / 連線紀錄.csv: "
+                         "captured -> dequeued (background thread) -> handed (yielded to SDK) -> send_returned "
+                         "(SDK send_audio returned = written to local WebSocket). Server receipt is not observable. "
+                         "audio_sent_seconds (old name) = audio_handed_seconds",
         }
         try:
             (self.cfg.out_dir / CONFIG_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str),
                                                         encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as e:
+            self._log_error(f"Could not write {CONFIG_FILE}: {e}")
 
     def _make_client(self):
         if self._client_factory:
@@ -691,8 +752,14 @@ class LiveSession:
             if self._down_since is not None:            # 結束時還沒恢復的那次也算進去
                 self._downtime += time.monotonic() - self._down_since
                 self._down_since = None
+            with self._meter_lock:      # 音訊核對：收音 = 佇列剩下 + 交給 SDK + orphaned（＋ 還在背景執行緒手上的）
+                audit = (f" captured_chunks={self._next_seq} dequeued_chunks={self._dequeued_count} "
+                         f"handed_chunks={self._handed_count} send_returned_chunks={self._send_returned_count} "
+                         f"orphaned_chunks={len(self._orphaned_seqs)} orphaned_seqs={self._orphaned_seqs[:50]} "
+                         f"input_overflows={self._overflows_total}")
             self._log_conn("end", downtime=self._downtime,
-                           detail=f"duration={self.elapsed():.0f}s drops={self._drops} segments={len(self.segments)}")
+                           detail=f"duration={self.elapsed():.0f}s drops={self._drops} segments={len(self.segments)}"
+                                  + audit)
 
     async def _main(self):
         client = self._make_client()
@@ -728,9 +795,11 @@ class LiveSession:
             self._write_pending()
             # 等收音執行緒把最後的音訊寫進錄音檔、關檔
             await asyncio.get_running_loop().run_in_executor(None, producer.join, 10)
-            self._latency_log.flush()
-            self._health_log.flush()
-            self._translation_log.flush()
+            self._flush_research_logs()
+
+    def _flush_research_logs(self):
+        for log in (self._latency_log, self._health_log, self._translation_log, self._asr_event_log):
+            log.flush()
 
     # 音訊：麥克風或檔案 → 錄音檔 ＋ thread queue
     # 錄音檔在這裡寫，所以網路斷掉、還沒送去辨識的音訊也會先存進錄音檔
@@ -756,8 +825,11 @@ class LiveSession:
                 self._audio_file = None
 
     def _emit_audio(self, chunk: bytes):
+        with self._meter_lock:                      # 收音順序編號（只在收音執行緒呼叫，但計數會被別的執行緒讀）
+            seq = self._next_seq
+            self._next_seq += 1
         self._save_audio(chunk)
-        self._audio_q.put(chunk)
+        self._audio_q.put((seq, chunk))
         # 音量換成 dB，-60 dB（幾乎沒聲音）到 -10 dB（很大聲）對應到 0–1
         rms = float(np.sqrt(np.mean(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) ** 2))) if chunk else 0.0
         db = 20 * np.log10(max(rms, 1.0) / 32768)
@@ -766,6 +838,7 @@ class LiveSession:
         loud = level >= self.LOUD_LEVEL
         with self._meter_lock:
             self.audio_captured_seconds += len(chunk) / 2 / SAMPLE_RATE
+            self._captured_seq = seq
             self._sec_chunks += 1
             self._sec_loud += loud
         if loud:
@@ -783,7 +856,7 @@ class LiveSession:
         device, failures = self.cfg.input_device, 0
 
         def cb(indata, frames, t, status):
-            raw_q.put(bytes(indata))
+            self._mic_callback(raw_q, indata, status)
 
         while not self._stop.is_set():
             try:
@@ -822,17 +895,59 @@ class LiveSession:
         while not raw_q.empty():
             self._emit_audio(raw_q.get_nowait())
 
-    async def _audio_stream(self) -> AsyncIterator[bytes]:
+    def _mic_callback(self, raw_q, indata, status):
+        """sounddevice 的 callback（音訊執行緒）：只放進佇列、數 overflow，不碰磁碟。"""
+        raw_q.put(bytes(indata))
+        if status and getattr(status, "input_overflow", False):
+            with self._meter_lock:
+                self._sec_overflows += 1
+                self._overflows_total += 1
+
+    def _dequeue(self, holder: dict):
+        """在背景執行緒從 _audio_q 取一段（行為和原本的 get(True, 0.2) 一樣），並記下取出的序號。
+        如果等待中這條連線已經取消，這段音訊沒人收了：記成 orphaned（取消時的競態）。"""
+        seq, chunk = self._audio_q.get(True, 0.2)
+        with self._meter_lock:
+            self._dequeued_seq = seq
+            self._dequeued_count += 1
+            if holder["cancelled"]:
+                self._orphaned_seqs.append(seq)
+            else:
+                holder["item"] = (seq, chunk)
+        return seq, chunk
+
+    async def _audio_stream(self, stats: dict) -> AsyncIterator[bytes]:
+        """把 _audio_q 裡的音訊依序交給 SDK（FIFO，格式不變：只 yield PCM bytes）。stats 是這條連線的序號統計。"""
         loop = asyncio.get_running_loop()
         while True:
+            holder = {"cancelled": False, "item": None}
             try:
-                chunk = await loop.run_in_executor(None, self._audio_q.get, True, 0.2)
+                seq, chunk = await loop.run_in_executor(None, self._dequeue, holder)
             except thread_queue.Empty:
                 if self._stop.is_set():
                     return
                 continue
+            except BaseException:
+                # 連線被取消：背景執行緒可能已經（或稍後才）從 _audio_q 取走一段 → 那段記成 orphaned
+                with self._meter_lock:
+                    holder["cancelled"] = True
+                    if holder["item"] is not None:
+                        self._orphaned_seqs.append(holder["item"][0])
+                        holder["item"] = None
+                raise
+            with self._meter_lock:
+                holder["item"] = None
+                self._handed_seq = seq
+                self._handed_count += 1
+                if stats["first"] is None:
+                    stats["first"] = seq
+                stats["last"] = seq
             self.audio_seconds += len(chunk) / 2 / SAMPLE_RATE
             yield chunk
+            # SDK 回來要下一段 = 這一段的 send_audio() 已經返回（寫進本機 WebSocket；伺服器有沒有收到無法觀測）
+            with self._meter_lock:
+                self._send_returned_seq = stats["send_returned"] = seq
+                self._send_returned_count += 1
 
     def _save_audio(self, chunk: bytes):
         """收到的每一段音訊寫進錄音檔（在收音執行緒呼叫，跟網路狀況無關）。"""
@@ -852,7 +967,7 @@ class LiveSession:
     async def _stt_loop(self, client):
         from mistralai.client.models import (AudioFormat, RealtimeTranscriptionError,
                                              TranscriptionStreamDone, TranscriptionStreamLanguage,
-                                             TranscriptionStreamTextDelta)
+                                             TranscriptionStreamSegmentDelta, TranscriptionStreamTextDelta)
         fmt = AudioFormat(encoding="pcm_s16le", sample_rate=SAMPLE_RATE)
         failures = 0
 
@@ -871,11 +986,13 @@ class LiveSession:
                         pieces = self._buffer.add(ev.text)
                     for p in pieces:
                         self._add_segment(p)
-                elif isinstance(ev, TranscriptionStreamLanguage):
+                    continue
+                self._record_asr_event(ev)          # 研究用：其他事件都記進 ASR事件.csv（行為不受影響）
+                if isinstance(ev, TranscriptionStreamLanguage):
                     with self.lock:
                         self.language = ev.audio_language
                 elif isinstance(ev, TranscriptionStreamDone):
-                    return
+                    return "TranscriptionDone"
                 elif isinstance(ev, RealtimeTranscriptionError):
                     # 伺服器那邊出錯（例如逾時、辨識引擎當掉）：這條連線通常已經壞了，
                     # 直接斷開重連，不要一直等；還沒送出的音訊會在重連後補送
@@ -887,11 +1004,16 @@ class LiveSession:
                         self._session_created()
                     if not self._stop.is_set():
                         self._set_status("Recording")
+                # TranscriptionStreamSegmentDelta 和未知事件：原本就不處理，現在只多記一筆
+            return "StreamEnded"                    # 伺服器結束了連線（沒有送 transcription.done）
 
         while True:
             self._set_status("Connecting…")
             try:
-                kwargs = dict(audio_stream=self._audio_stream(), model=self.cfg.stt_model, audio_format=fmt)
+                stats = {"first": None, "last": None, "send_returned": None}   # 這條連線實際拿到的音訊序號
+                with self._meter_lock:
+                    self._conn_stats = stats
+                kwargs = dict(audio_stream=self._audio_stream(stats), model=self.cfg.stt_model, audio_format=fmt)
                 if self.cfg.target_delay_ms:
                     kwargs["target_streaming_delay_ms"] = self.cfg.target_delay_ms
                 self._last_text_at = time.monotonic()
@@ -906,6 +1028,11 @@ class LiveSession:
                                and time.monotonic() - self._last_text_at > self.STALL_SECONDS
                                and self._loud_since_text >= self.STALL_LOUD_CHUNKS)
                     if stalled:
+                        # 研究用：判定卡死的當下先記一筆（lost 要等 SDK 關完連線才記，中間的時間就是關閉花的時間）
+                        self._log_conn("stall_detected", attempt=failures + 1, loud=self._loud_since_text,
+                                       since_last_text=time.monotonic() - self._last_text_real,
+                                       detail=f"since_connect_or_text_seconds="
+                                              f"{time.monotonic() - self._last_text_at:.1f}")
                         consumer.cancel()
                         try:
                             await consumer
@@ -913,7 +1040,10 @@ class LiveSession:
                             pass
                         raise SilentStall(f"no text for {self.STALL_SECONDS}s although the microphone "
                                               "hears speech — restarting the connection")
-                await consumer          # 把 consume 裡的錯誤丟出來
+                ended = await consumer          # 把 consume 裡的錯誤丟出來
+                if not self._stop.is_set():
+                    # 研究用：伺服器自己結束連線（沒有錯誤）→ 原本就直接重連（不等待）；現在多記一筆 lost
+                    self._went_down(f"server ended the stream without error ({ended})", None, ended)
             except Exception as e:
                 # 沒按停止就一直重連（例如教室 Wi-Fi 斷了一陣子）；斷線期間的音訊會排隊，連上後一起補送
                 failures += 1
@@ -939,7 +1069,42 @@ class LiveSession:
             "audio_sent_seconds": round(self.audio_seconds, 2),
             "audio_captured_seconds": round(self.audio_captured_seconds, 2),
             "backlog_seconds": round(self.audio_captured_seconds - self.audio_seconds, 2),
-            "chars": len(text), "text": text})
+            "chars": len(text), "text": text,
+            "handed_seq": "" if self._handed_seq is None else self._handed_seq,
+            "captured_seq": "" if self._captured_seq is None else self._captured_seq})
+
+    def _record_asr_event(self, ev):
+        """不是 text.delta 的 ASR 事件記一筆到 ASR事件.csv（text.delta 只在 字幕時效.csv，不會重複）。
+        segment 的 start/end 原樣保留：還不知道它是以這條連線開頭、還是整段音訊為 0。"""
+        now = time.monotonic()
+        etype = getattr(ev, "type", None) or type(ev).__name__
+        text = getattr(ev, "text", None)
+        detail = ""
+        session = getattr(ev, "session", None)
+        if session is not None:
+            detail = (f"request_id={getattr(session, 'request_id', '')} model={getattr(session, 'model', '')} "
+                      f"target_streaming_delay_ms={getattr(session, 'target_streaming_delay_ms', '')}")
+        elif getattr(ev, "audio_language", None):
+            detail = f"audio_language={ev.audio_language}"
+        elif getattr(ev, "error", None) is not None and hasattr(ev.error, "code"):
+            msg = ev.error.message
+            detail = f"code={ev.error.code} message={getattr(msg, 'detail', msg)}"
+        elif hasattr(ev, "content"):                # UnknownRealtimeEvent
+            detail = f"error={getattr(ev, 'error', '')} content={str(ev.content)[:300]}"
+        elif isinstance(text, str):
+            detail = text if not hasattr(ev, "segments") else f"segments={len(ev.segments or [])}"
+
+        def raw(x):
+            return "" if x is None or type(x).__name__ in ("Unset", "UnsetType") else x
+        self._asr_event_log.add({
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "t_seconds": round(now - self._t0, 3), "class_folder": self.cfg.out_dir.name,
+            "conn_id": self._conn_id, "event_type": etype,
+            "text_chars": len(text) if isinstance(text, str) else "",
+            "seg_start_raw": raw(getattr(ev, "start", None)), "seg_end_raw": raw(getattr(ev, "end", None)),
+            "handed_seq": "" if self._handed_seq is None else self._handed_seq,
+            "audio_handed_seconds": round(self.audio_seconds, 2),
+            "detail": re.sub(r"\s+", " ", str(detail))[:500]})
 
     def _record_translation(self, seg: Segment, started: float, attempts: int):
         """一句話翻譯完（或三次都失敗）：記下斷句時間、排隊多久、翻譯花多久、重試幾次。"""
@@ -965,7 +1130,12 @@ class LiveSession:
                 with self._meter_lock:
                     chunks, self._sec_chunks = self._sec_chunks, 0
                     loud, self._sec_loud = self._sec_loud, 0
+                    overflows, self._sec_overflows = self._sec_overflows, 0
                     captured = self.audio_captured_seconds
+                    seqs = {k: "" if v is None else v for k, v in (
+                        ("captured_seq", self._captured_seq), ("dequeued_seq", self._dequeued_seq),
+                        ("handed_seq", self._handed_seq), ("send_returned_seq", self._send_returned_seq))}
+                    orphaned = len(self._orphaned_seqs)
                 chars, self._sec_chars = self._sec_chars, 0
                 self._health_log.add({
                     "wall_time": datetime.now().isoformat(timespec="milliseconds"),
@@ -974,12 +1144,11 @@ class LiveSession:
                     "since_last_text_seconds": round(now - self._last_text_real, 1),
                     "down": int(self._down_since is not None),
                     "audio_sent_seconds": round(self.audio_seconds, 2),
-                    "backlog_seconds": round(captured - self.audio_seconds, 2)})
+                    "backlog_seconds": round(captured - self.audio_seconds, 2),
+                    "input_overflows": overflows, **seqs, "orphaned_chunks": orphaned})
                 n += 1
                 if n % 5 == 0:
-                    self._latency_log.flush()
-                    self._health_log.flush()
-                    self._translation_log.flush()
+                    self._flush_research_logs()
         except asyncio.CancelledError:
             pass
 
