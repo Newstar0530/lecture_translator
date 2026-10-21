@@ -104,8 +104,8 @@ streamlit run app.py
 ## 連線紀錄
 
 每次斷線、恢復都會自動記下來，方便看出問題出在哪：
-- 每堂課一份：課程資料夾裡的 `連線紀錄.csv`
-- 所有課程一份總表：`records/連線紀錄_全部.csv`（可以用 Excel / Numbers 打開）
+- 每堂課一份：課程資料夾裡的 `connection_log.csv`
+- 所有課程一份總表：`records/connection_log_all.csv`（可以用 Excel / Numbers 打開）
 - 欄位：
   - `time`（到毫秒）、`t_seconds`（從開始錄音算起，和下面的研究用 CSV 同一個起點，可直接對齊）、`code_version`（程式的 git commit）、課程、`class_folder`、`conn_id`（第幾條連線）
   - `event`：start / stall_detected / lost / reconnect_start / session_created / recovered / end
@@ -118,7 +118,7 @@ streamlit run app.py
   - 音訊追蹤（每一筆都有）：`loud_chunks_since_text`（上次收到文字後有幾格明顯說話聲）、`audio_captured_seconds`、`audio_handed_seconds`、各階段最後一段的序號 `captured_seq` / `dequeued_seq` / `handed_seq` / `send_returned_seq`、目前這條連線實際交給 SDK 的第一段與最後一段 `conn_first_handed_seq` / `conn_last_handed_seq` / `conn_last_send_returned_seq`、`queued_chunks`（還在佇列）、`orphaned_chunks`（累計被取消競態丟掉的段數）
   - `end` 的 `detail` 有整堂課的音訊核對：`captured_chunks`、`dequeued_chunks`、`handed_chunks`、`send_returned_chunks`、`orphaned_chunks`、`orphaned_seqs`、`input_overflows`
 - 一次中斷拆成「偵測（lost）→ 等待 → 開始連線（reconnect_start）→ 連上（session_created）→ 第一筆字幕（recovered）」
-- 欄位改過時，舊檔會改名成 `…_舊格式_日期時間.csv` 保留，新資料寫進新檔，不會混在一起
+- 欄位改過時，舊檔會改名成 `…_old_format_日期時間.csv` 保留，新資料寫進新檔，不會混在一起
 - 在「📂 Earlier classes」選一堂課，會顯示那堂課和所有課程的斷線摘要
 
 研究用量測（課程資料夾裡，每 5 秒寫檔一次；寫不進去不影響錄音，但會在畫面的 ⚠️ Messages 顯示）：
@@ -129,10 +129,10 @@ streamlit run app.py
   - `handed`：交給 Mistral SDK（舊欄位 `audio_sent_seconds` 就是這個，名字保留不改）
   - `send_returned`：SDK 的 `send_audio()` 已經返回＝已寫進本機 WebSocket。**伺服器有沒有真的收到、有沒有處理，程式看不到（Unknown）**
   - `orphaned`：已經從佇列取出、但連線剛好被取消，沒交給 SDK 的段。目前每次重連通常會丟 1 段（100 毫秒），都有記錄；這次只記錄、不補送
-- `ASR事件.csv`：每個不是辨識文字（`text.delta`）的 ASR 事件記一筆——`session.created`（含伺服器的 `request_id`、實際的 `target_streaming_delay_ms`）、`transcription.language`、`transcription.segment`（`seg_start_raw` / `seg_end_raw` 原樣保留：還不確定是以這條連線開頭還是整段音訊為 0）、`transcription.done`、`error`、未知事件。`text.delta` 只記在 `字幕時效.csv`，不會重複
-- `字幕時效.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
-- `健康指標.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）、這一秒麥克風 input overflow 次數（`input_overflows`，表示有音訊被系統丟掉）、各階段音訊序號、累計 orphaned 段數。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
-- `翻譯時效.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `字幕時效.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
+- `asr_events.csv`：每個不是辨識文字（`text.delta`）的 ASR 事件記一筆——`session.created`（含伺服器的 `request_id`、實際的 `target_streaming_delay_ms`）、`transcription.language`、`transcription.segment`（`seg_start_raw` / `seg_end_raw` 原樣保留：還不確定是以這條連線開頭還是整段音訊為 0）、`transcription.done`、`error`、未知事件。`text.delta` 只記在 `subtitle_latency.csv`，不會重複
+- `subtitle_latency.csv`：每收到一段辨識文字記一筆——時間、第幾條連線（`conn_id`）、已送出的音訊秒數（`audio_sent_seconds`）、已收音秒數（`audio_captured_seconds`，＝ `錄音.flac` 裡的位置）、排隊還沒送出的秒數（`backlog_seconds`）、字數與文字。用來算「話說出來 → 字幕出現」的延遲
+- `health_metrics.csv`：每秒一筆——這一秒音量明顯的格數（`loud_chunks`，每格 100 毫秒）、收到的字數、距離上次收到文字幾秒、是否斷線中（`down`）、這一秒麥克風 input overflow 次數（`input_overflows`，表示有音訊被系統丟掉）、各階段音訊序號、累計 orphaned 段數。用來算有效字幕可用率，以及之後拿錄音做模擬、比較不同卡死偵測門檻
+- `translation_latency.csv`：每句話翻譯完（或三次都失敗）記一筆——斷好句的時間（`segment_t_seconds`）、在佇列等多久（`queue_seconds`）、翻譯 API 花多久（`translate_seconds`，含重試）、從斷句到中文字幕出現的總時間（`total_seconds`）、重試次數、成功與否。和 `subtitle_latency.csv` 合起來，就能分開算「辨識層」和「使用者看到中文字幕」兩層的延遲
 
 ## 下課後從錄音檔重新辨識
 
@@ -140,7 +140,7 @@ streamlit run app.py
 - 把整段 `錄音.flac` 交給 Mistral 的「整段錄音辨識」（voxtral-mini），看得到完整上下文，通常比即時辨識準；即時辨識塞車、當掉的時候也能用
 - 會照側邊欄 **Lecture language** 指定語言，並把簡報和修正過的專有名詞當作辨識提示
 - 原本的即時逐字稿保留不動，結果另外存成 `逐字稿_原文_完整.txt`、`逐字稿_雙語_完整.md`，接著自動產生筆記
-- 同時存一份 `參考時間軸.csv`：每個字在 `錄音.flac` 裡的開始、結束秒數。和 `字幕時效.csv` 對照，可以算每段話的字幕有沒有及時出現（有效字幕可用率）（之後按「Generate notes」也會優先用完整版）
+- 同時存一份 `reference_timeline.csv`：每個字在 `錄音.flac` 裡的開始、結束秒數。和 `subtitle_latency.csv` 對照，可以算每段話的字幕有沒有及時出現（有效字幕可用率）（之後按「Generate notes」也會優先用完整版）
 - 一堂 30 分鐘的課大約 40 秒完成；需要錄音時有打開「Also save the recording」
 
 ## 專有名詞閃卡

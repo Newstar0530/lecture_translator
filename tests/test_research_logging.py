@@ -350,7 +350,7 @@ class ResearchLoggingTests(unittest.TestCase):
             self.assertEqual(types_[:4], ["session.created", "transcription.language", "transcription.segment",
                                           "transcription.mystery"])
             self.assertEqual(types_[-1], "transcription.done")
-            self.assertNotIn("transcription.text.delta", types_)               # delta 只在 字幕時效.csv
+            self.assertNotIn("transcription.text.delta", types_)               # delta 只在 subtitle_latency.csv
             seg = run.asr[2]
             self.assertEqual((seg["seg_start_raw"], seg["seg_end_raw"]), ("0.5", "1.2"))
             self.assertIn("request_id=req-0", run.asr[0]["detail"])

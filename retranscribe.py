@@ -26,7 +26,7 @@ CUT_SEARCH_SECONDS = 30       # 在每段結尾前 30 秒內找最安靜的地�
 LANG_CODES = {"English": "en", "French": "fr"}
 FULL_SOURCE = "逐字稿_原文_完整.txt"
 FULL_BILINGUAL = "逐字稿_雙語_完整.md"
-REFERENCE_TIMELINE = "參考時間軸.csv"   # 每個字在 錄音.flac 裡的開始、結束秒數（算有效字幕可用率的基準）
+REFERENCE_TIMELINE = "reference_timeline.csv"   # 每個字在 錄音.flac 裡的開始、結束秒數（算有效字幕可用率的基準）
 
 Line = tuple[float, str]      # (開始秒數, 原文)
 Word = tuple[float, float, str]   # (開始秒數, 結束秒數, 文字；英文字前面通常帶空格)
@@ -108,7 +108,7 @@ def group_lines(words: list[Word]) -> list[Line]:
 
 
 def write_reference_timeline(path: Path, words: list[Word]):
-    """把每個字的時間存成 CSV：和即時字幕的 字幕時效.csv 對照，就能算每段話的字幕有沒有及時出現。"""
+    """把每個字的時間存成 CSV：和即時字幕的 subtitle_latency.csv 對照，就能算每段話的字幕有沒有及時出現。"""
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["start_seconds", "end_seconds", "text"])

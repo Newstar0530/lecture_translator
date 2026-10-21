@@ -344,8 +344,8 @@ class SessionConfig:
     save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
-CONN_LOG = "連線紀錄.csv"                  # 每堂課一份（在課程資料夾裡）
-CONN_LOG_ALL = "連線紀錄_全部.csv"         # 所有課程一份總表（在 records/ 裡）
+CONN_LOG = "connection_log.csv"                  # 每堂課一份（在課程資料夾裡）
+CONN_LOG_ALL = "connection_log_all.csv"         # 所有課程一份總表（在 records/ 裡）
 CONN_LOG_FIELDS = ["time", "t_seconds", "code_version", "course", "class_folder", "conn_id", "event", "category",
                    "error_type", "attempt", "since_last_text_seconds", "since_lost_seconds", "connect_seconds",
                    "downtime_seconds", "detail",
@@ -357,19 +357,19 @@ CONN_LOG_FIELDS = ["time", "t_seconds", "code_version", "course", "class_folder"
 CONFIG_FILE = "設定.json"                  # 每堂課一份：程式版本與所有門檻、模型設定（之後比較不同課堂用）
 
 # 研究用量測（量字幕延遲、卡死偵測延遲；之後可以拿 錄音.flac 做 trace-driven 模擬）
-LATENCY_LOG = "字幕時效.csv"               # 每收到一段辨識文字記一筆
+LATENCY_LOG = "subtitle_latency.csv"               # 每收到一段辨識文字記一筆
 LATENCY_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "audio_sent_seconds", "audio_captured_seconds",
                       "backlog_seconds", "chars", "text", "handed_seq", "captured_seq"]
-TRANSLATION_LOG = "翻譯時效.csv"           # 每句話翻譯完（或放棄）記一筆
+TRANSLATION_LOG = "translation_latency.csv"           # 每句話翻譯完（或放棄）記一筆
 TRANSLATION_LOG_FIELDS = ["wall_time", "idx", "segment_t_seconds", "start_t_seconds", "done_t_seconds",
                           "queue_seconds", "translate_seconds", "total_seconds", "attempts", "ok",
                           "audio_sent_seconds", "chars", "error"]
-HEALTH_LOG = "健康指標.csv"                # 每秒記一筆
+HEALTH_LOG = "health_metrics.csv"                # 每秒記一筆
 HEALTH_LOG_FIELDS = ["wall_time", "t_seconds", "conn_id", "loud_chunks", "chunks", "text_chars",
                      "since_last_text_seconds", "down", "audio_sent_seconds", "backlog_seconds",
                      "input_overflows", "captured_seq", "dequeued_seq", "handed_seq", "send_returned_seq",
                      "orphaned_chunks"]
-ASR_EVENT_LOG = "ASR事件.csv"              # 每個不是 text.delta 的 ASR 事件記一筆（text.delta 只記在 字幕時效.csv）
+ASR_EVENT_LOG = "asr_events.csv"              # 每個不是 text.delta 的 ASR 事件記一筆（text.delta 只記在 subtitle_latency.csv）
 ASR_EVENT_LOG_FIELDS = ["wall_time", "t_seconds", "class_folder", "conn_id", "event_type", "text_chars",
                         "seg_start_raw", "seg_end_raw", "handed_seq", "audio_handed_seconds", "detail"]
 # 音訊序號（seq）：每段 100 毫秒的音訊在收音時編號，從 0 開始遞增
@@ -412,7 +412,7 @@ def append_csv(path: Path, fields: list[str], rows: list[dict]):
         with open(path, newline="", encoding="utf-8") as f:
             header = next(csv.reader(f), [])
         if header != fields:
-            path.rename(path.with_name(f"{path.stem}_舊格式_{datetime.now():%Y%m%d-%H%M%S}{path.suffix}"))
+            path.rename(path.with_name(f"{path.stem}_old_format_{datetime.now():%Y%m%d-%H%M%S}{path.suffix}"))
             new = True
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -611,7 +611,7 @@ class LiveSession:
                   downtime: Optional[float] = None, detail: str = "", error: str = "",
                   since_last_text: Optional[float] = None, since_lost: Optional[float] = None,
                   connect: Optional[float] = None, loud: Optional[int] = None):
-        """寫一筆連線紀錄到這堂課的 連線紀錄.csv 和 records/連線紀錄_全部.csv（寫不進去也不影響錄音）。
+        """寫一筆連線紀錄到這堂課的 connection_log.csv 和 records/connection_log_all.csv（寫不進去也不影響錄音）。
         t_seconds 和其他研究用 CSV 用同一個起點，可以直接對齊；秒數欄位都用 monotonic 時鐘算。"""
         def sec(x):
             return "" if x is None else round(x, 3)
@@ -716,7 +716,7 @@ class LiveSession:
                                "instantaneous value at the tick",
                            "loud_chunk": f"{CHUNK_MS} ms chunk with level >= {self.LOUD_LEVEL}"},
             "ui_refresh_seconds": 1.0,
-            "audio_seq": "each 100 ms chunk gets seq 0,1,2,... at capture; see ASR事件.csv / 連線紀錄.csv: "
+            "audio_seq": "each 100 ms chunk gets seq 0,1,2,... at capture; see asr_events.csv / connection_log.csv: "
                          "captured -> dequeued (background thread) -> handed (yielded to SDK) -> send_returned "
                          "(SDK send_audio returned = written to local WebSocket). Server receipt is not observable. "
                          "audio_sent_seconds (old name) = audio_handed_seconds",
@@ -987,7 +987,7 @@ class LiveSession:
                     for p in pieces:
                         self._add_segment(p)
                     continue
-                self._record_asr_event(ev)          # 研究用：其他事件都記進 ASR事件.csv（行為不受影響）
+                self._record_asr_event(ev)          # 研究用：其他事件都記進 asr_events.csv（行為不受影響）
                 if isinstance(ev, TranscriptionStreamLanguage):
                     with self.lock:
                         self.language = ev.audio_language
@@ -1058,7 +1058,7 @@ class LiveSession:
                 return
             # 伺服器結束了這次連線但使用者沒按停止 → 自動重連
 
-    # ----- 研究用量測（字幕時效.csv、健康指標.csv）-----
+    # ----- 研究用量測（subtitle_latency.csv、health_metrics.csv）-----
     def _record_text(self, text: str):
         now = time.monotonic()
         self._last_text_real = now
@@ -1074,7 +1074,7 @@ class LiveSession:
             "captured_seq": "" if self._captured_seq is None else self._captured_seq})
 
     def _record_asr_event(self, ev):
-        """不是 text.delta 的 ASR 事件記一筆到 ASR事件.csv（text.delta 只在 字幕時效.csv，不會重複）。
+        """不是 text.delta 的 ASR 事件記一筆到 asr_events.csv（text.delta 只在 subtitle_latency.csv，不會重複）。
         segment 的 start/end 原樣保留：還不知道它是以這條連線開頭、還是整段音訊為 0。"""
         now = time.monotonic()
         etype = getattr(ev, "type", None) or type(ev).__name__
