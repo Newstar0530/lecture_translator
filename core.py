@@ -766,8 +766,9 @@ class LiveSession:
             **({"gemini": {"google_genai_sdk": _pkg_version("google-genai"),
                            "live_rotation_seconds": "proactive reconnect every 570 s (Live sessions are capped at 10 min); "
                                                     "each rotation ends with transcription.done -> normal reconnect",
-                           "text_events": "only finalized input_transcription (per utterance) is used as text; "
-                                          "interim transcripts are ignored",
+                           "text_events": "completed sentences inside interim_input_transcription are emitted early "
+                                          "(sentence followed by more words); the final input_transcription "
+                                          "adds only the words not yet emitted (aligned by word count)",
                            "send_returned": "means session.send_realtime_input returned"}}
                if self.cfg.provider == "gemini" else {}),
             "audio_seq": "each 100 ms chunk gets seq 0,1,2,... at capture; see asr_events.csv / connection_log.csv: "

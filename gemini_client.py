@@ -115,6 +115,7 @@ class _Realtime:
             send_task = asyncio.create_task(sender())
             deadline: Optional[float] = None       # 送出「聲音結束」後，最晚等到這個時間
             next_task: Optional[asyncio.Future] = None
+            emitted = 0                            # 這一段話裡已經送出幾個字
             try:
                 while True:
                     # session.receive() 每一輪對話結束就停，所以外面要再包一層迴圈
@@ -142,11 +143,25 @@ class _Realtime:
                                 raise _Finished()          # 聲音送完、這一輪結果也收完了
                             break                          # 還在送聲音：開下一輪接收
                         sc = getattr(resp, "server_content", None)
-                        tr = getattr(sc, "input_transcription", None) if sc else None
-                        if tr is not None and (tr.text or "").strip():
-                            # 確定的辨識結果（講者停頓、一段話結束時才會給）；後面補空白，讓斷句器接得起來
-                            texts.append(tr.text.strip())
-                            yield TranscriptionStreamTextDelta(text=tr.text.strip() + " ")
+                        interim = getattr(sc, "interim_input_transcription", None) if sc else None
+                        final = getattr(sc, "input_transcription", None) if sc else None
+                        # 加速：確定結果要等一段話講完（連續講課時常常 15 秒以上），
+                        # 暫時結果裡「已經講完、後面還接著新字」的句子幾乎不會再變，先送出去
+                        if interim is not None and (interim.text or "").strip():
+                            words = interim.text.split()
+                            done = [i for i, w in enumerate(words[:-1]) if re.search(r"[.!?…]['\")\]]*$", w)]
+                            if done and done[-1] + 1 > emitted:
+                                piece = " ".join(words[emitted:done[-1] + 1])
+                                emitted = done[-1] + 1
+                                texts.append(piece)
+                                yield TranscriptionStreamTextDelta(text=piece + " ")
+                        if final is not None and (final.text or "").strip():
+                            # 確定結果：只補上還沒送出的部分（用字數對齊，避免跟上面先送的重複）
+                            rest = " ".join(final.text.split()[emitted:])
+                            emitted = 0                        # 下一段話重新算
+                            if rest:
+                                texts.append(rest)
+                                yield TranscriptionStreamTextDelta(text=rest + " ")
                     if send_task.done() and not send_task.cancelled() and send_task.exception():
                         raise send_task.exception()
             except _Finished:
