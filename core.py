@@ -341,6 +341,7 @@ class SessionConfig:
     slide_brief: str = ""                              # 從簡報整理的課程背景
     slide_terms: dict = field(default_factory=dict)   # 從簡報找到的譯名 {原文: 中文}
     language: str = "English"                         # 主要授課語言：English / French
+    provider: str = "mistral"                         # 用哪家的 API：mistral / gemini（預設 Mistral，研究基準）
     save_audio: bool = True                  # 同時把錄音存成 FLAC（無損壓縮）
 
 
@@ -482,6 +483,14 @@ def classify_problem(msg: str) -> str:
                             "dns", "ssl", "eof", "reset by peer")):
         return "network / connection closed"
     return "other"
+
+
+def _pkg_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return "unknown"
 
 
 class LiveSession:
@@ -735,6 +744,7 @@ class LiveSession:
             "started_at": datetime.fromtimestamp(self.started_at).isoformat(timespec="milliseconds"),
             "t_seconds_origin": "t_seconds = 0 at started_at (monotonic clock)",
             "python": sys.version.split()[0], "mistralai_sdk": sdk, "platform": sys.platform,
+            "provider": self.cfg.provider,
             "session_config": cfg,
             "glossary": {"fixed_terms": len(self.cfg.fixed_terms), "slide_terms": len(self.cfg.slide_terms),
                          "slide_brief_chars": len(self.cfg.slide_brief)},
@@ -753,6 +763,13 @@ class LiveSession:
                                "instantaneous value at the tick",
                            "loud_chunk": f"{CHUNK_MS} ms chunk with level >= {self.LOUD_LEVEL}"},
             "ui_refresh_seconds": 1.0,
+            **({"gemini": {"google_genai_sdk": _pkg_version("google-genai"),
+                           "live_rotation_seconds": "proactive reconnect every 570 s (Live sessions are capped at 10 min); "
+                                                    "each rotation ends with transcription.done -> normal reconnect",
+                           "text_events": "only finalized input_transcription (per utterance) is used as text; "
+                                          "interim transcripts are ignored",
+                           "send_returned": "means session.send_realtime_input returned"}}
+               if self.cfg.provider == "gemini" else {}),
             "audio_seq": "each 100 ms chunk gets seq 0,1,2,... at capture; see asr_events.csv / connection_log.csv: "
                          "captured -> dequeued (background thread) -> handed (yielded to SDK) -> send_returned "
                          "(SDK send_audio returned = written to local WebSocket). Server receipt is not observable. "
@@ -767,6 +784,9 @@ class LiveSession:
     def _make_client(self):
         if self._client_factory:
             return self._client_factory(self.cfg.api_key)
+        if self.cfg.provider == "gemini":
+            from gemini_client import GeminiClient       # 介面跟 Mistral client 一樣，下面的流程不用改
+            return GeminiClient(self.cfg.api_key, self.cfg.language)
         from mistralai.client import Mistral
         return Mistral(api_key=self.cfg.api_key)
 
@@ -1081,7 +1101,14 @@ class LiveSession:
                         raise SilentStall(f"no text for {self.STALL_SECONDS}s although the microphone "
                                               "hears speech — restarting the connection")
                 ended = await consumer          # 把 consume 裡的錯誤丟出來
-                if not self._stop.is_set():
+                if self.cfg.provider == "gemini" and ended == "TranscriptionDone":
+                    # Gemini Live 一條連線最多 10 分鐘，轉接層每 9.5 分鐘主動收尾換新連線：
+                    # 這是預定的換連線，不是故障；另外記成 planned_rotation，不算進斷線（行為不變，照常馬上重連）
+                    ended = "PlannedRotation"
+                    if not self._stop.is_set():
+                        self._log_conn("planned_rotation", category="planned rotation (Gemini Live 10-min limit)",
+                                       detail="proactive reconnect before the 10-minute Live session cap")
+                elif not self._stop.is_set():
                     # 研究用：伺服器自己結束連線（沒有錯誤）→ 原本就直接重連（不等待）；現在多記一筆 lost
                     self._went_down(f"server ended the stream without error ({ended})", None, ended)
             except Exception as e:

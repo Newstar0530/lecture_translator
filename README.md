@@ -101,6 +101,25 @@ streamlit run app.py
 
 ---
 
+## 選擇用 Mistral 或 Gemini
+
+側邊欄 **Lecture information → AI provider** 可以選 **Mistral**（預設，研究基準）或 **Gemini**。選了之後，即時字幕、翻譯、筆記、讀簡報、下課後整段辨識都會改用那一家；「Advanced settings」裡的模型欄位會自動換成那一家的預設值，也可以自己改。
+
+| 功能 | Mistral（預設） | Gemini |
+|---|---|---|
+| 即時字幕 | voxtral-mini-transcribe-realtime-2602 | gemini-3.5-transcribe-live |
+| 翻譯 | mistral-small-2603 | gemini-3.5-flash-lite |
+| 筆記 / 讀簡報 | mistral-medium / mistral-large | gemini-3.6-flash |
+| 下課後整段辨識 | voxtral-mini-2602 | gemini-3.5-transcribe |
+
+**用 Gemini 要先設定**：到 https://aistudio.google.com/apikey 申請金鑰，在 `.env` 加一行 `GEMINI_API_KEY=貼上金鑰`，重新啟動程式。
+
+**Gemini 的差別**
+- Gemini Live 一條連線最多 10 分鐘，程式每 9 分 30 秒會主動換新連線（連線紀錄裡記成 `planned_rotation`，不算斷線）
+- Gemini 的即時字幕是講者停頓、一段話講完才給確定的結果，字幕出現的節奏會跟 Mistral 不太一樣
+- 免費方案的內容可能被 Google 用來改進產品、可能有人工審閱；你在歐洲，使用條款對歐洲另有規定，正式使用建議開付費方案
+- 每堂課的 `config.json` 會記錄用的是哪一家（`provider`），研究分析時可以分開
+
 ## 連線紀錄
 
 每次斷線、恢復都會自動記下來，方便看出問題出在哪：

@@ -20,7 +20,9 @@ import streamlit as st
 import flashcards
 import notion_sync
 import retranscribe
-from core import (CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_STT_MODEL, DEFAULT_TRANSLATE_MODEL,
+import gemini_client
+from core import (CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_SLIDES_MODEL, DEFAULT_STT_MODEL,
+                  DEFAULT_TRANSLATE_MODEL,
                   SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
                   fmt_time, generate_notes, list_input_devices, merge_terms, split_slide_text)
@@ -332,19 +334,41 @@ def get_shared_state() -> SharedState:
 ss = get_shared_state()
 
 # ---------------------------------------------------------------- 側邊欄：上課前的設定
-with st.sidebar:
-    # 金鑰只從 .env（或環境變數）讀取，留在本機程式裡，不送到瀏覽器
-    api_key = load_env_key()
-    if not api_key:
-        st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
+# 每家 API 各功能的預設模型（Mistral 是研究的基準設定，不要改）
+PROVIDER_DEFAULTS = {
+    "mistral": {"key": "MISTRAL_API_KEY", "stt": DEFAULT_STT_MODEL, "trans": DEFAULT_TRANSLATE_MODEL,
+                "notes": DEFAULT_NOTES_MODEL, "slides": DEFAULT_SLIDES_MODEL, "file_stt": retranscribe.BATCH_STT_MODEL},
+    "gemini": {"key": "GEMINI_API_KEY", "stt": gemini_client.GEMINI_LIVE_STT_MODEL,
+               "trans": gemini_client.GEMINI_TRANSLATE_MODEL, "notes": gemini_client.GEMINI_NOTES_MODEL,
+               "slides": gemini_client.GEMINI_SLIDES_MODEL, "file_stt": gemini_client.GEMINI_FILE_STT_MODEL},
+}
 
-    # 第一組：Lecture information（課程名稱＋簡報）
+def api_client():
+    """依側邊欄選的 provider 建立 client（Gemini 轉接層的介面跟 Mistral 一樣）。"""
+    if provider == "gemini":
+        return gemini_client.GeminiClient(api_key, language)
+    from mistralai.client import Mistral
+    return Mistral(api_key=api_key)
+
+
+with st.sidebar:
+    # 第一組：Lecture information（課程名稱＋語言＋用哪家 API＋簡報）
     with st.container(key="grp_class"):
         st.markdown("#### Lecture information")
         course = st.text_input("Course name")
         language = st.selectbox("Lecture language", ["English", "French"], index=0,
                                 help="The main language of this class. Speech recognition detects the language "
                                      "automatically; this tells translation and notes what to expect")
+        provider_label = st.segmented_control(
+            "AI provider", ["Mistral", "Gemini"], default="Mistral",
+            help="Which company's models to use for speech recognition, translation, notes and slides. "
+                 "Mistral is the research baseline; Gemini needs GEMINI_API_KEY in .env") or "Mistral"
+        provider = provider_label.lower()
+        defaults = PROVIDER_DEFAULTS[provider]
+        # 金鑰只從 .env（或環境變數）讀取，留在本機程式裡，不送到瀏覽器
+        api_key = load_env_key(defaults["key"])
+        if not api_key:
+            st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
 
         # 上課前讀簡報：整理課程背景和專有名詞，翻譯和筆記都會用到。同一個檔案只分析一次
         slides_file = st.file_uploader("Lecture slides", type=["pdf", "pptx"],
@@ -354,6 +378,7 @@ with st.sidebar:
             data = slides_file.getvalue()
             digest = hashlib.sha256(data).hexdigest()
             cached = st.session_state.get("slides")
+            digest = f"{provider}:{digest}"           # 換 API 就重新讀一次簡報
             if cached and cached["digest"] == digest:
                 slides = cached
             elif api_key:
@@ -363,7 +388,9 @@ with st.sidebar:
                     label = ("Reading slides… (about 10 seconds)" if n_parts == 1 else
                              f"Reading long slides in {min(n_parts, SLIDES_MAX_PARTS)} parts… (about 10–20 seconds)")
                     with st.spinner(label):
-                        brief, terms, warning = analyze_slides(api_key, slide_text)
+                        brief, terms, warning = analyze_slides(
+                            api_key, slide_text, model=st.session_state.get(f"slides_{provider}", defaults["slides"]),
+                            client=api_client())
                         slides = {"digest": digest, "name": slides_file.name, "summary": brief, "terms": terms,
                                   "warning": warning, "pages": len(re.findall(r"\[第 \d+ 頁\]", slide_text)),
                                   "parts": n_parts}
@@ -414,9 +441,13 @@ with st.sidebar:
     terms_slot = st.container(key="grp_terms")
 
     with st.expander("Advanced settings"):
-        stt_model = st.text_input("Speech recognition model", DEFAULT_STT_MODEL)
-        trans_model = st.text_input("Translation model", DEFAULT_TRANSLATE_MODEL)
-        notes_model = st.text_input("Notes model", DEFAULT_NOTES_MODEL)
+        # key 帶上 provider：換 API 時，模型欄位會自動換成那一家的預設值
+        stt_model = st.text_input("Speech recognition model (live)", defaults["stt"], key=f"stt_{provider}")
+        trans_model = st.text_input("Translation model", defaults["trans"], key=f"trans_{provider}")
+        notes_model = st.text_input("Notes model", defaults["notes"], key=f"notes_{provider}")
+        slides_model = st.text_input("Slides model", defaults["slides"], key=f"slides_{provider}")
+        file_stt_model = st.text_input("Recording transcription model (after class)", defaults["file_stt"],
+                                       key=f"filestt_{provider}")
         delay_opt = st.selectbox("Recognition delay (ms)", ["Default", "240", "480", "960", "1600", "2400"],
                                  help="Shorter delay shows subtitles sooner; longer delay is usually more accurate")
         min_chars = st.slider("Minimum characters per translated segment", 30, 200, 80, 10,
@@ -476,7 +507,7 @@ if running:
 
 if start_clicked:
     if not api_key:
-        st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
+        st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
     elif source != "Microphone" and not wav_path:
         st.error("Upload a WAV file in the sidebar first")
     else:
@@ -488,7 +519,7 @@ if start_clicked:
                             min_chars=min_chars, fixed_terms=load_fixed_terms(course),
                             slide_brief=slides["summary"] if slides else "",
                             slide_terms=slides["terms"] if slides else {}, save_audio=save_audio,
-                            language=language)
+                            language=language, provider=provider)
         ss.session = LiveSession(cfg)
         if slides:   # 存一份，之後從舊逐字稿產生筆記時也能用
             (out_dir / SLIDES_FILE).write_text(json.dumps(
@@ -511,7 +542,7 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
     cache_dir = out_dir / ".notes_cache"
     with st.status("Generating notes…", expanded=True) as box:
         try:
-            notes = generate_notes(api_key, transcript, course, date_str, model=notes_model,
+            notes = generate_notes(api_key, transcript, course, date_str, model=notes_model, client=api_client(),
                                    progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background,
                                    language=language)
             path = out_dir / "notes.md"
@@ -528,7 +559,7 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
 
 if note_clicked:
     if not api_key:
-        st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
+        st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
                    f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir,
@@ -723,12 +754,13 @@ if saved:
                              help="Uses the full transcript if this class was re-transcribed, otherwise the live one")
         notes_ok = False
         if (do_re or do_notes) and not api_key:
-            st.error("Mistral API key not found: create a .env file as described in the README, then restart the app")
+            st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
         elif do_re:
             with st.status("Re-transcribing from the recording…", expanded=True) as box:
                 try:
                     lines = retranscribe.retranscribe(api_key, pick, course_name, language, slide_terms, fixed,
-                                                      background, trans_model, progress=box.write)
+                                                      background, trans_model, progress=box.write,
+                                                      client=api_client(), stt_model=file_stt_model)
                     live_n = len((pick / "transcript_source.txt").read_text(encoding="utf-8").splitlines()) \
                         if _has(pick, "transcript_source.txt") else 0
                     box.update(label=f"Re-transcribed: {len(lines)} lines (live transcript had {live_n})",

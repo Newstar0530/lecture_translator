@@ -59,10 +59,11 @@ def split_audio(path: Path, part_seconds: int = PART_SECONDS) -> list[tuple[floa
     return parts
 
 
-def _transcribe_part(client, data: bytes, language: str, bias: list[str]) -> list[Word]:
+def _transcribe_part(client, data: bytes, language: str, bias: list[str],
+                     model: str = BATCH_STT_MODEL) -> list[Word]:
     """辨識一段錄音，回傳每個字 [(開始秒數, 結束秒數, 文字)]（這段裡的秒數）。
     失敗會重試；專有名詞提示被拒絕就拿掉再試。"""
-    kw = {"model": BATCH_STT_MODEL, "file": {"file_name": "part.flac", "content": data},
+    kw = {"model": model, "file": {"file_name": "part.flac", "content": data},
           "timestamp_granularities": ["word"]}
     if LANG_CODES.get(language):
         kw["language"] = LANG_CODES[language]
@@ -147,7 +148,8 @@ def _translate_line(client, lines: list[Line], i: int, glossary: dict[str, str],
 def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "English",
                  slide_terms: Optional[dict[str, str]] = None, fixed_terms: Optional[dict[str, str]] = None,
                  background: str = "", translate_model: str = DEFAULT_TRANSLATE_MODEL,
-                 progress: Optional[Callable[[str], None]] = None, client=None) -> list[Line]:
+                 progress: Optional[Callable[[str], None]] = None, client=None,
+                 stt_model: str = BATCH_STT_MODEL) -> list[Line]:
     """
     從 out_dir/recording.flac 重新辨識整堂課並翻譯，存成完整逐字稿，回傳 [(開始秒數, 原文)]。
     progress 只會在呼叫這個函式的執行緒裡被呼叫（Streamlit 可以直接拿來更新畫面）。
@@ -168,7 +170,7 @@ def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "Engl
     say(f"Transcribing {len(parts)} part(s) of ~10 minutes…")
     results: dict[int, list[Word]] = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_transcribe_part, client, data, language, bias): i
+        futures = {pool.submit(_transcribe_part, client, data, language, bias, stt_model): i
                    for i, (_, data) in enumerate(parts)}
         for n, fut in enumerate(as_completed(futures), 1):
             i = futures[fut]
@@ -177,7 +179,7 @@ def retranscribe(api_key: str, out_dir: Path, course: str, language: str = "Engl
             say(f"Transcribed {n}/{len(parts)}")
     words = [w for i in sorted(results) for w in results[i]]
     write_reference_timeline(out_dir / REFERENCE_TIMELINE, words)
-    _note_config(out_dir, {"model": BATCH_STT_MODEL, "timestamp_granularity": "word", "part_seconds": PART_SECONDS,
+    _note_config(out_dir, {"model": stt_model, "timestamp_granularity": "word", "part_seconds": PART_SECONDS,
                            "language": language, "context_bias_terms": len(bias),
                            "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
     lines = group_lines(words)
