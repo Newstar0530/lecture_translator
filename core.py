@@ -548,6 +548,8 @@ class LiveSession:
         self._send_returned_count = 0
         self._orphaned_seqs: list[int] = []
         self._conn_stats = {"first": None, "last": None, "send_returned": None}   # 目前這條連線
+        self.auto_stop_reason: Optional[str] = None  # 自動停止的原因（睡眠太久、太久沒聲音）；None = 使用者自己按停止
+        self._last_audio_at = time.monotonic()      # 最後一次收到麥克風音訊（單調時鐘，Mac 睡眠時不會走）
         self.activity_open: dict[str, float] = {}  # 目前標記為進行中的課堂情境 {"video": 標記的 t_seconds}
         self._sec_overflows = 0                     # 這一秒麥克風 input overflow 幾次
         self._overflows_total = 0
@@ -763,6 +765,9 @@ class LiveSession:
                                "instantaneous value at the tick",
                            "loud_chunk": f"{CHUNK_MS} ms chunk with level >= {self.LOUD_LEVEL}"},
             "ui_refresh_seconds": 1.0,
+            "auto_stop": {"after_system_sleep_seconds": self.AUTO_STOP_SLEEP_SECONDS,
+                          "after_no_audio_seconds": self.AUTO_STOP_NO_AUDIO_SECONDS,
+                          "short_sleep_logged_if_over_seconds": self.SLEEP_LOG_SECONDS},
             **({"gemini": {"google_genai_sdk": _pkg_version("google-genai"),
                            "live_rotation_seconds": "proactive reconnect every 570 s (Live sessions are capped at 10 min); "
                                                     "each rotation ends with transcription.done -> normal reconnect",
@@ -806,7 +811,8 @@ class LiveSession:
                 self._caffeinate = None
             self.running = False
             self.ended_at = time.time()
-            self._set_status("Stopped")
+            self._set_status(f"Stopped automatically — {self.auto_stop_reason}" if self.auto_stop_reason
+                             else "Stopped")
             for activity in list(self.activity_open):  # 錄音結束時還標記著進行中 → 自動補一筆結束
                 self.mark_activity(activity, start=False, source="session_end",
                                    note="still marked as ongoing when recording stopped")
@@ -831,6 +837,7 @@ class LiveSession:
         idle = asyncio.create_task(self._idle_flusher())
         stt = asyncio.create_task(self._stt_loop(client))
         health = asyncio.create_task(self._health_logger())
+        watchdog = asyncio.create_task(self._auto_stop_watchdog())
         stop_seen: Optional[float] = None
         try:
             # 按下停止後，最多等 20 秒讓伺服器送回最後的辨識結果
@@ -848,6 +855,7 @@ class LiveSession:
         finally:
             idle.cancel()
             health.cancel()
+            watchdog.cancel()
             rest = self._buffer.flush()
             if rest:
                 self._add_segment(rest)
@@ -857,6 +865,41 @@ class LiveSession:
             # 等收音執行緒把最後的音訊寫進錄音檔、關檔
             await asyncio.get_running_loop().run_in_executor(None, producer.join, 10)
             self._flush_research_logs()
+
+    @staticmethod
+    def _sleep_offset() -> float:
+        """牆鐘減單調時鐘。Mac 睡眠時單調時鐘停住、牆鐘照走，這個差就會突然變大＝睡了多久。"""
+        return time.time() - time.monotonic()
+
+    async def _auto_stop_watchdog(self):
+        """每秒檢查：睡眠太久或太久沒收到音訊 → 自動停止錄音（避免忘了按停止，隔天又錄進不相干的聲音）。
+        不影響卡死偵測和重連。"""
+        base = self._sleep_offset()
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(1)
+                offset = self._sleep_offset()
+                slept = offset - base
+                base = offset
+                if slept >= self.SLEEP_LOG_SECONDS:
+                    self._log_conn("system_sleep", detail=f"slept_seconds={slept:.0f}")
+                    if slept >= self.AUTO_STOP_SLEEP_SECONDS:
+                        self._auto_stop(f"the Mac slept for {slept / 60:.0f} min", "system_sleep", slept)
+                        return
+                silent = time.monotonic() - self._last_audio_at
+                if silent >= self.AUTO_STOP_NO_AUDIO_SECONDS:
+                    self._auto_stop(f"no sound from the microphone for {silent / 60:.0f} min", "no_audio", silent)
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    def _auto_stop(self, reason: str, category: str, seconds: float):
+        if self._stop.is_set():
+            return
+        self.auto_stop_reason = reason
+        self._log_error(f"Recording stopped automatically: {reason}")
+        self._log_conn("auto_stop", category=category, detail=f"{category}_seconds={seconds:.0f} reason={reason}")
+        self.stop()
 
     def _flush_research_logs(self):
         for log in (self._latency_log, self._health_log, self._translation_log, self._asr_event_log):
@@ -886,6 +929,7 @@ class LiveSession:
                 self._audio_file = None
 
     def _emit_audio(self, chunk: bytes):
+        self._last_audio_at = time.monotonic()
         with self._meter_lock:                      # 收音順序編號（只在收音執行緒呼叫，但計數會被別的執行緒讀）
             seq = self._next_seq
             self._next_seq += 1
@@ -1022,6 +1066,10 @@ class LiveSession:
 
     # 卡死偵測：麥克風這段時間一直有人在講話，卻超過 STALL_SECONDS 秒沒有任何文字回來 → 當作連線卡死，重連
     STALL_SECONDS = 30
+    # 忘記按停止的保護：Mac 睡眠超過這麼久，醒來就自動停止錄音；麥克風完全沒聲音超過這麼久也停止
+    AUTO_STOP_SLEEP_SECONDS = 600
+    AUTO_STOP_NO_AUDIO_SECONDS = 600
+    SLEEP_LOG_SECONDS = 5           # 睡眠（或程式被暫停）超過這麼久就記一筆 system_sleep
     STALL_LOUD_CHUNKS = 150        # 15 秒（每格 100 毫秒）音量明顯的聲音
     LOUD_LEVEL = 0.5               # 約 -35 dB，一般講話的音量；教室底噪通常在這以下
 

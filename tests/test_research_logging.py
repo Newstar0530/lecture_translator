@@ -407,6 +407,61 @@ class ResearchLoggingTests(unittest.TestCase):
         finally:
             run.close()
 
+    # 14. 睡眠太久 → 醒來自動停止；短暫睡眠 → 只記錄、繼續錄
+    def test_14_auto_stop_after_sleep(self):
+        def sleepy(jump):
+            class SleepySession(core.LiveSession):
+                AUTO_STOP_SLEEP_SECONDS = 3
+                SLEEP_LOG_SECONDS = 1
+
+                def _sleep_offset(self):            # 模擬：錄音第 2 秒時 Mac「睡了」jump 秒
+                    slept = jump if time.monotonic() - self._t0 > 2 else 0
+                    return time.time() - time.monotonic() + slept
+            return SleepySession
+
+        run = Run(["text"], seconds=20, session_cls=sleepy(5.0))
+        try:
+            self.assertEqual(run.s.auto_stop_reason, "the Mac slept for 0 min")
+            self.assertTrue(run.s.status.startswith("Stopped automatically"))
+            self.assertEqual([r["event"] for r in run.conn if r["event"] in ("system_sleep", "auto_stop")],
+                             ["system_sleep", "auto_stop"])
+            self.assertEqual(run.events("auto_stop")[0]["category"], "system_sleep")
+            self.assertLess(run.audit["captured_chunks"], run.expected_chunks)     # 提早停了
+            self.assertTrue(run.events("end"))
+        finally:
+            run.close()
+
+        run = Run(["text"], seconds=6, session_cls=sleepy(2.0))           # 2 秒 < 3 秒門檻
+        try:
+            self.assertIsNone(run.s.auto_stop_reason)
+            self.assertEqual(len(run.events("system_sleep")), 1)
+            self.assertEqual(run.events("auto_stop"), [])
+            self.assertEqual(run.audit["captured_chunks"], run.expected_chunks)    # 照常錄完
+        finally:
+            run.close()
+
+    # 15. 麥克風太久沒有聲音 → 自動停止
+    def test_15_auto_stop_no_audio(self):
+        class QuietMicSession(core.LiveSession):
+            AUTO_STOP_NO_AUDIO_SECONDS = 2
+
+            def _audio_producer(self):              # 只送 1 秒音訊，之後麥克風沒有任何資料
+                for _ in range(10):
+                    self._emit_audio(b"\x00\x00" * core.CHUNK_SAMPLES)
+                    time.sleep(0.1)
+                self._stop.wait()
+                if self._audio_file is not None:
+                    self._audio_file.close()
+                    self._audio_file = None
+
+        run = Run(["text"], seconds=1, session_cls=QuietMicSession)
+        try:
+            self.assertTrue(run.s.auto_stop_reason.startswith("no sound from the microphone"))
+            self.assertEqual(run.events("auto_stop")[0]["category"], "no_audio")
+            self.assertEqual(run.audit["captured_chunks"], 10)
+        finally:
+            run.close()
+
     # 寫檔失敗要看得到
     def test_12_log_write_failure_is_visible(self):
         errors = []
