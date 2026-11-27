@@ -441,6 +441,17 @@ class ServerErrorEvent(ConnectionError):
         self.code = code
 
 
+def quota_exhausted(msg: str) -> bool:
+    """這個 API 錯誤是不是「額度用完、今天（或這個月）重試也沒用」：
+    Gemini 每日額度（quotaId 含 PerDay）、Mistral 的帳戶花費上限（HTTP 402 / billing_spend_limit）。
+    每分鐘的速率限制（PerMinute、一般 429 Too Many Requests）不算：等一下就會恢復，照常重試。"""
+    m = msg.lower()
+    if "perminute" in m and "perday" not in m:
+        return False
+    return ("perday" in m or "billing_spend_limit" in m or "spending limit" in m
+            or ("402" in m and ("payment" in m or "spend" in m or "billing" in m)))
+
+
 def error_type(e: BaseException) -> str:
     """錯誤的類別名稱＋代碼（例如 ServerErrorEvent:3001、ConnectionClosedError:1012），統計故障原因用。"""
     code = (getattr(getattr(e, "rcvd", None), "code", None)       # websockets 的 close code（例如 1012）
@@ -548,6 +559,7 @@ class LiveSession:
         self._send_returned_count = 0
         self._orphaned_seqs: list[int] = []
         self._conn_stats = {"first": None, "last": None, "send_returned": None}   # 目前這條連線
+        self.translation_unavailable: Optional[str] = None   # 翻譯額度用完的原因；之後的句子不再呼叫翻譯 API
         self.auto_stop_reason: Optional[str] = None  # 自動停止的原因（睡眠太久、太久沒聲音）；None = 使用者自己按停止
         self._last_audio_at = time.monotonic()      # 最後一次收到麥克風音訊（單調時鐘，Mac 睡眠時不會走）
         self.activity_open: dict[str, float] = {}  # 目前標記為進行中的課堂情境 {"video": 標記的 t_seconds}
@@ -759,7 +771,8 @@ class LiveSession:
             "sentence_buffer": {"min_chars": b.min_chars, "max_chars": b.max_chars,
                                 "idle_seconds": b.idle_seconds, "comma_seconds": b.comma_seconds,
                                 "comma_chars": b.comma_chars},
-            "translation_retry": "3 attempts; wait 5*(n) s on 429, else 1.5*(n) s",
+            "translation_retry": "3 attempts; wait 5*(n) s on 429, else 1.5*(n) s; daily quota / spending limit "
+                                 "(quota_exhausted) -> no retry, skip translation for the rest of the class",
             "health_log": {"loud_chunks, chunks, text_chars": "counts over the previous 1 s (reset every tick)",
                            "since_last_text_seconds, down, audio_sent_seconds, backlog_seconds":
                                "instantaneous value at the tick",
@@ -1294,6 +1307,14 @@ class LiveSession:
                 context = " ".join(s.source for s in self.segments[max(0, seg.idx - 2):seg.idx])
             started = time.monotonic()
             attempts = 0
+            if self.translation_unavailable:
+                # 額度已經用完：不再呼叫 API（也不重試），原文照常顯示，雙語逐字稿標成「額度用完」
+                with self.lock:
+                    seg.error = f"Translation skipped: {self.translation_unavailable}"
+                    seg.translation = ""
+                self._record_translation(seg, started, attempts)
+                self._write_pending()
+                continue
             for attempt in range(3):
                 attempts = attempt + 1
                 try:
@@ -1310,6 +1331,16 @@ class LiveSession:
                         seg.translation = text
                     break
                 except Exception as e:
+                    if quota_exhausted(str(e)):
+                        # 每日額度或花費上限用完：重試沒用，這堂課剩下的句子都不翻譯，只提示一次
+                        reason = f"translation quota exhausted ({self.cfg.translate_model})"
+                        self.translation_unavailable = reason
+                        with self.lock:
+                            seg.error = f"Translation skipped: {reason}"
+                            seg.translation = ""
+                        self._log_error(f"Translation stopped for the rest of this class: the {self.cfg.translate_model} "
+                                        f"quota is used up. Original text is still shown. Details: {str(e)[:300]}")
+                        break
                     wait = 5 * (attempt + 1) if "429" in str(e) else 1.5 * (attempt + 1)
                     if attempt == 2:
                         with self.lock:
@@ -1335,7 +1366,9 @@ class LiveSession:
         if ready:
             with open(self.transcript_path, "a", encoding="utf-8") as f:
                 for s in ready:
-                    f.write(f"**[{fmt_time(s.elapsed)}]** {s.source}\n\n> {s.translation or '（翻譯失敗）'}\n\n")
+                    zh = s.translation or ("（翻譯額度已用完，未翻譯）" if (s.error or "").startswith("Translation skipped")
+                                           else "（翻譯失敗）")
+                    f.write(f"**[{fmt_time(s.elapsed)}]** {s.source}\n\n> {zh}\n\n")
 
 
 # ---------------------------------------------------------------------------

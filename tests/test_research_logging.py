@@ -97,6 +97,9 @@ class FakeRealtime:
                     return                         # 伺服器自己結束串流（沒有 done、沒有錯誤）
                 if beh.startswith("silent"):
                     continue
+                if beh == "sentences":                 # 每次一整句，斷句器才會切出很多句
+                    yield TranscriptionStreamTextDelta(text=f"This is sentence number {len(got)} of the test. ")
+                    continue
                 yield TranscriptionStreamTextDelta(text=f"Word{len(got)} ")
         finally:
             closed["v"] = True
@@ -461,6 +464,54 @@ class ResearchLoggingTests(unittest.TestCase):
             self.assertEqual(run.audit["captured_chunks"], 10)
         finally:
             run.close()
+
+    # 16. 翻譯額度用完：不重試、之後的句子不再呼叫 API、只提示一次；每分鐘限制照常重試
+    def test_16_translation_quota_exhausted(self):
+        def run_with(error_text, beh):
+            calls = []
+
+            class QuotaChat:
+                async def complete_async(self, **kw):
+                    calls.append(time.monotonic())
+                    raise RuntimeError(error_text)
+
+            class QuotaSession(core.LiveSession):
+                pass
+
+            r = Run.__new__(Run)
+            tmp = tempfile.TemporaryDirectory()
+            root = Path(tmp.name)
+            wav = root / "in.wav"
+            make_wav(wav, 4)
+            out = root / "records" / "q"
+            client = types.SimpleNamespace(audio=types.SimpleNamespace(realtime=FakeRealtime([beh])),
+                                           chat=QuotaChat())
+            s = QuotaSession(core.SessionConfig(api_key="x", out_dir=out, wav_path=str(wav), wav_speed=2.0,
+                                                save_audio=False, min_chars=10), client_factory=lambda k: client)
+            s._keep_awake = lambda: None
+            s.start()
+            s.join(120)
+            rows = read_csv(out / core.TRANSLATION_LOG)
+            bilingual = (out / "transcript_bilingual.md").read_text(encoding="utf-8")
+            tmp.cleanup()
+            return s, calls, rows, bilingual
+
+        daily = ("429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota', "
+                 "'details': [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]}}")
+        s, calls, rows, bilingual = run_with(daily, "sentences")
+        self.assertGreater(len(rows), 2)
+        self.assertEqual(len(calls), 1, "only the first sentence calls the API; no retries after daily quota")
+        self.assertEqual([r["attempts"] for r in rows], ["1"] + ["0"] * (len(rows) - 1))
+        self.assertTrue(all(r["ok"] == "0" and "quota exhausted" in r["error"] for r in rows))
+        self.assertEqual(sum("Translation stopped" in e for e in s.errors), 1)       # 只提示一次
+        self.assertNotIn("Translation failed", " ".join(s.errors))
+        self.assertIn("翻譯額度已用完", bilingual)
+
+        minute = "429 RESOURCE_EXHAUSTED quotaId GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+        s, calls, rows, _ = run_with(minute, "text")       # 只會有一句（每句重試要約 15 秒）
+        self.assertIsNone(s.translation_unavailable)
+        self.assertTrue(rows and all(r["attempts"] == "3" for r in rows))            # 每分鐘限制照常重試
+        self.assertEqual(len(calls), 3 * len(rows))
 
     # 寫檔失敗要看得到
     def test_12_log_write_failure_is_visible(self):
