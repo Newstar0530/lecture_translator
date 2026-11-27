@@ -161,7 +161,8 @@ streamlit run app.py
 
 即時字幕斷掉、卡住，或聽錯很多時，下課後打開主畫面最下面的「📂 Earlier classes」，選那堂課，按 **🎙 Re-transcribe from recording**：
 - 把整段 `recording.flac` 交給 Mistral 的「整段錄音辨識」（voxtral-mini），看得到完整上下文，通常比即時辨識準；即時辨識塞車、當掉的時候也能用
-- 會照側邊欄 **Lecture language** 指定語言，並把簡報和修正過的專有名詞當作辨識提示
+- 預設用**這堂課錄音時**的 AI provider（Mistral / Gemini）和授課語言（記在 `config.json`），不看側邊欄，所以重新整理網頁後也不會用錯；那一家額度用完時，可以在「AI provider for this class」換另一家。主畫面錄完音後按的「Generate notes」也一樣用錄音時的 provider 和語言
+- 會把簡報和修正過的專有名詞當作辨識提示
 - 原本的即時逐字稿保留不動，結果另外存成 `transcript_source_full.txt`、`transcript_bilingual_full.md`，接著自動產生筆記（之後按「Generate notes」也會優先用完整版）
 - 同時存一份 `reference_timeline.csv`：每個字在 `recording.flac` 裡的開始、結束秒數。和 `subtitle_latency.csv` 對照，可以算每段話的字幕有沒有及時出現（有效字幕可用率）
 - 一堂 30 分鐘的課大約 40 秒完成；需要錄音時有打開「Also save the recording」

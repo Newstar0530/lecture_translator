@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +22,7 @@ import flashcards
 import notion_sync
 import retranscribe
 import gemini_client
-from core import (CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_SLIDES_MODEL, DEFAULT_STT_MODEL,
+from core import (CONFIG_FILE, CONN_LOG, CONN_LOG_ALL, DEFAULT_NOTES_MODEL, DEFAULT_SLIDES_MODEL, DEFAULT_STT_MODEL,
                   DEFAULT_TRANSLATE_MODEL,
                   SLIDES_MAX_PARTS,
                   LiveSession, SessionConfig, TermBook, analyze_slides, extract_slide_text, fix_brief,
@@ -536,13 +537,42 @@ if stop_clicked:
     st.rerun()
 
 
+def class_setup(out_dir: Path) -> dict:
+    """這堂課錄音時用的 provider 和語言（從 config.json）。沒有 config.json 的舊課程都是用 Mistral 錄的。"""
+    try:
+        data = json.loads((out_dir / CONFIG_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    sc = data.get("session_config", {})
+    p = data.get("provider") or sc.get("provider") or "mistral"
+    return {"provider": p if p in PROVIDER_DEFAULTS else "mistral", "language": sc.get("language")}
+
+
+def provider_ai(p: str, lang: str) -> types.SimpleNamespace:
+    """指定 provider 的金鑰、模型和 client。模型用側邊欄填的（如果有改過），沒有就用那一家的預設值。"""
+    d = PROVIDER_DEFAULTS[p]
+    key = load_env_key(d["key"])
+    label = "Gemini" if p == "gemini" else "Mistral"
+
+    def client():
+        if p == "gemini":
+            return gemini_client.GeminiClient(key, lang)
+        from mistralai.client import Mistral
+        return Mistral(api_key=key)
+    return types.SimpleNamespace(
+        provider=p, label=label, key_name=d["key"], api_key=key, client=client,
+        notes_model=st.session_state.get(f"notes_{p}") or d["notes"],
+        trans_model=st.session_state.get(f"trans_{p}") or d["trans"],
+        file_stt_model=st.session_state.get(f"filestt_{p}") or d["file_stt"])
+
+
 def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
-               glossary: dict[str, str], background: str, language: str = ""):
-    """產生筆記並存到 out_dir/notes.md。分段結果先暫存，失敗後再按一次會接續。"""
+               glossary: dict[str, str], background: str, language: str, ai: types.SimpleNamespace):
+    """產生筆記並存到 out_dir/notes.md。分段結果先暫存，失敗後再按一次會接續。ai：用哪一家（provider_ai）。"""
     cache_dir = out_dir / ".notes_cache"
-    with st.status("Generating notes…", expanded=True) as box:
+    with st.status(f"Generating notes with {ai.label}…", expanded=True) as box:
         try:
-            notes = generate_notes(api_key, transcript, course, date_str, model=notes_model, client=api_client(),
+            notes = generate_notes(ai.api_key, transcript, course, date_str, model=ai.notes_model, client=ai.client(),
                                    progress=box.write, cache_dir=cache_dir, glossary=glossary, background=background,
                                    language=language)
             path = out_dir / "notes.md"
@@ -558,14 +588,16 @@ def make_notes(transcript: str, course: str, date_str: str, out_dir: Path,
 
 
 if note_clicked:
-    if not api_key:
-        st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
+    # 用這堂課錄音時的 provider，不看側邊欄（重新整理網頁後側邊欄會跳回 Mistral）
+    note_ai = provider_ai(sess.cfg.provider, sess.cfg.language)
+    if not note_ai.api_key:
+        st.error(f"{note_ai.label} API key not found: add {note_ai.key_name}=... to .env, then restart the app")
     else:
         make_notes(sess.full_source_text(), sess.cfg.course,
                    f"{datetime.fromtimestamp(sess.started_at):%Y-%m-%d}", sess.cfg.out_dir,
                    merge_terms(sess.cfg.slide_terms, sess.terms.fixed()),
                    fix_brief(sess.cfg.slide_brief, sess.cfg.slide_terms, sess.terms.fixed()),
-                   sess.cfg.language)
+                   sess.cfg.language, note_ai)
 
 
 def seg_html(seg, show_en: bool, latest: bool, fresh: bool = False) -> str:
@@ -742,25 +774,33 @@ if saved:
         if (RECORDS_DIR / CONN_LOG_ALL).exists():
             st.caption(f"📊 All classes: {conn_summary(RECORDS_DIR / CONN_LOG_ALL)} "
                        f"(details in records/{CONN_LOG_ALL})")
-        st.caption(f"Uses the Lecture language selected in the sidebar ({language}). "
+        # 預設用這堂課錄音時的 provider 和語言（不看側邊欄：重新整理網頁後側邊欄會跳回 Mistral / English）
+        setup = class_setup(pick)
+        rec_label = "Gemini" if setup["provider"] == "gemini" else "Mistral"
+        pick_label = st.segmented_control(
+            "AI provider for this class", ["Mistral", "Gemini"], default=rec_label, key=f"pick_provider_{pick.name}",
+            help="Defaults to the provider this class was recorded with. Switch if its quota is used up") or rec_label
+        pick_lang = setup["language"] or language
+        pick_ai = provider_ai(pick_label.lower(), pick_lang)
+        st.caption(f"Recorded with {rec_label}; using {pick_ai.label} and {pick_lang}. "
                    "Re-transcribing keeps the live transcript and saves a separate full one, then makes the notes.")
         r1, r2 = st.columns(2)
         do_re = r1.button("🎙 Re-transcribe from recording", type="primary", use_container_width=True,
                           disabled=busy or not _has(pick, "recording.flac"),
-                          help="Sends the whole recording to Mistral's file transcription (more accurate than live, "
+                          help="Sends the whole recording to the AI provider's file transcription (more accurate than live, "
                                "and works when live recognition is down), translates it, then generates notes")
         do_notes = r2.button("📝 Generate notes", use_container_width=True,
                              disabled=busy or not (_has(pick, retranscribe.FULL_SOURCE) or _has(pick, "transcript_source.txt")),
                              help="Uses the full transcript if this class was re-transcribed, otherwise the live one")
         notes_ok = False
-        if (do_re or do_notes) and not api_key:
-            st.error(f"{provider_label} API key not found: add {defaults['key']}=... to .env, then restart the app")
+        if (do_re or do_notes) and not pick_ai.api_key:
+            st.error(f"{pick_ai.label} API key not found: add {pick_ai.key_name}=... to .env, then restart the app")
         elif do_re:
             with st.status("Re-transcribing from the recording…", expanded=True) as box:
                 try:
-                    lines = retranscribe.retranscribe(api_key, pick, course_name, language, slide_terms, fixed,
-                                                      background, trans_model, progress=box.write,
-                                                      client=api_client(), stt_model=file_stt_model)
+                    lines = retranscribe.retranscribe(pick_ai.api_key, pick, course_name, pick_lang, slide_terms, fixed,
+                                                      background, pick_ai.trans_model, progress=box.write,
+                                                      client=pick_ai.client(), stt_model=pick_ai.file_stt_model)
                     live_n = len((pick / "transcript_source.txt").read_text(encoding="utf-8").splitlines()) \
                         if _has(pick, "transcript_source.txt") else 0
                     box.update(label=f"Re-transcribed: {len(lines)} lines (live transcript had {live_n})",
@@ -770,13 +810,13 @@ if saved:
                     lines = None
             notes_ok = bool(lines) and make_notes(
                 (pick / retranscribe.FULL_SOURCE).read_text(encoding="utf-8"), course_name, date_str, pick,
-                merge_terms(slide_terms, fixed), background, language)
+                merge_terms(slide_terms, fixed), background, pick_lang, pick_ai)
         elif do_notes:
             src = retranscribe.FULL_SOURCE if _has(pick, retranscribe.FULL_SOURCE) else "transcript_source.txt"
             notes_ok = make_notes((pick / src).read_text(encoding="utf-8"), course_name, date_str, pick,
-                                  merge_terms(slide_terms, fixed), background, language)
+                                  merge_terms(slide_terms, fixed), background, pick_lang, pick_ai)
         # 筆記區塊在頁面上方、比這裡早畫，筆記做好後重新整理一次才看得到
-        if (do_re or do_notes) and api_key and notes_ok:
+        if (do_re or do_notes) and pick_ai.api_key and notes_ok:
             st.rerun()
 
 
